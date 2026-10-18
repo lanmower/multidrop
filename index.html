@@ -22,6 +22,9 @@
 <header>
   <h1>MultiDrop</h1>
   <div id="status">connecting …</div>
+  <label class="alias-edit">Your name
+    <input id="alias-input" maxlength="40" autocomplete="off" aria-label="Your device name">
+  </label>
 </header>
 
 <main>
@@ -30,9 +33,15 @@
     <div id="offers"></div>
   </section>
 
+  <section id="nearby">
+    <h2>Your devices</h2>
+    <p class="hint">Paired devices stay here wherever they are. Drop files or folders on one, or click it and choose.</p>
+    <div id="devices" class="stage"></div>
+  </section>
+
   <section id="pair-section">
-    <h2>Pair devices</h2>
-    <p class="hint">Pair once. Paired devices stay in your zone and show up below from any page you open.</p>
+    <h2>Pair a device</h2>
+    <p class="hint">Pair once and the device stays in your zone on every page, wherever it is. Show a code here and enter it there, or scan the QR code.</p>
     <div id="pair-requests"></div>
     <div class="row">
       <button id="pair-show" type="button" class="primary">Show a pairing code</button>
@@ -51,15 +60,6 @@
     </div>
     <p id="pair-state" class="meta"></p>
     <button id="leave-zone" type="button" class="danger" hidden>Leave zone on this device</button>
-  </section>
-
-  <section>
-    <div class="row">
-      <h2>Devices</h2>
-      <button id="refresh" type="button">Search</button>
-    </div>
-    <p class="hint">Drop files or folders on a device – or click it and choose.</p>
-    <div id="devices" class="grid"></div>
   </section>
 
   <section>

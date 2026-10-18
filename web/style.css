@@ -62,3 +62,46 @@ summary { cursor: pointer; color: var(--muted); }
 .welcome { border-left: 4px solid var(--accent); }
 .welcome ul { padding-left: 1.2rem; }
 #speaker { min-width: 14rem; flex: 1; }
+
+/* Web build: AirDrop-like radar. Paired devices sit on rings around "you",
+   online or not, as if they were all in the room. */
+.alias-edit { margin-left: auto; display: flex; align-items: center; gap: .5rem;
+              color: var(--muted); font-size: .85rem; }
+.alias-edit input { width: 11rem; }
+.stage { --r0: min(9rem, 29vw); --r1: min(15rem, 45vw); position: relative; height: 28rem;
+         margin: .5rem 0; border-radius: 16px; overflow: hidden;
+         background:
+           radial-gradient(circle at 50% 50%, transparent calc(var(--r0) - 1px), var(--line) var(--r0),
+                           transparent calc(var(--r0) + 1px)),
+           radial-gradient(circle at 50% 50%, transparent calc(var(--r1) - 1px), var(--line) var(--r1),
+                           transparent calc(var(--r1) + 1px)); }
+.stage.big { height: 42rem; }
+.me, .device { position: absolute; left: 50%; top: 50%; text-align: center; width: 7.5rem; }
+.me { transform: translate(-50%, -50%); }
+.device { transform: translate(-50%, -50%) rotate(var(--a)) translateY(calc(-1 * var(--r)))
+                     rotate(calc(-1 * var(--a))); }
+.device.card { background: none; border: none; padding: 0; }
+.avatar { position: relative; display: grid; place-items: center; width: 4.2rem; height: 4.2rem;
+          margin: 0 auto .35rem; border-radius: 50%; color: #fff; font-weight: 600; font-size: 1.4rem;
+          background: hsl(var(--hue, 215) 55% 46%); transition: transform .12s, box-shadow .12s; }
+.me .avatar { background: var(--accent); }
+.me .avatar::after, .device.card .avatar::after { content: ""; position: absolute; inset: -6px;
+          border-radius: 50%; border: 2px solid var(--accent); opacity: 0; animation: ping 2.6s ease-out infinite; }
+.device.card .avatar::after { border-color: var(--ok); animation-duration: 3.4s; }
+@keyframes ping { 0% { transform: scale(.85); opacity: .7; } 100% { transform: scale(1.5); opacity: 0; } }
+.device.drop { cursor: pointer; }
+.device.drop.over { transform: translate(-50%, -50%) rotate(var(--a)) translateY(calc(-1 * var(--r)))
+                              rotate(calc(-1 * var(--a))) scale(1.08); border: none; }
+.device.drop.over .avatar { box-shadow: 0 0 0 5px color-mix(in srgb, var(--accent) 40%, transparent); }
+.device.offline { opacity: .5; }
+.device.offline .avatar { filter: grayscale(.8); }
+.pairbubble { cursor: pointer; }
+.pairbubble .avatar { background: none; border: 2px dashed var(--muted); color: var(--muted); font-size: 2rem; }
+.stage .name { font-size: .9rem; }
+
+/* Incoming transfers appear as a prompt over the page, like AirDrop's. */
+#offers-section { position: fixed; left: 50%; bottom: 1rem; transform: translateX(-50%); z-index: 10;
+                  width: min(26rem, calc(100% - 2rem)); margin: 0; }
+#offers-section h2 { display: none; }
+#offers .card.offer { margin: 0 0 .5rem; border-radius: 16px; border-left-width: 1px;
+                      box-shadow: 0 10px 34px rgba(0, 0, 0, .3); }

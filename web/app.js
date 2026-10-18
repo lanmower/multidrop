@@ -10,7 +10,7 @@ const jobs = new Map();        // job id -> {info, files: Map(name -> {done,size
 const unchecked = new Map();   // offer id -> Set of file ids the user unticked
 let offers = [];               // incoming offers, oldest first
 let pendingPair = null;        // {name} while a joiner waits for approval (host side)
-let devices = [];              // devices online in this zone
+let devices = [];              // paired devices, online or not
 let wire = null;
 let alias = "";
 
@@ -158,8 +158,30 @@ function renderOffers() {
 // -- devices and sending --------------------------------------------------
 
 function refreshDevices() {
-  devices = wire ? wire.devices() : [];
+  devices = wire ? wire.members() : [];
   renderDevices();
+}
+
+function ago(ms) {
+  const s = Math.max(0, (Date.now() - ms) / 1000);
+  if (s < 90) return "just now";
+  if (s < 5400) return `${Math.round(s / 60)} min ago`;
+  if (s < 129600) return `${Math.round(s / 3600)} h ago`;
+  return `${Math.round(s / 86400)} d ago`;
+}
+
+function hueOf(text) {
+  let h = 0;
+  for (const ch of text) h = (h * 31 + ch.codePointAt(0)) % 360;
+  return h;
+}
+
+// Rings around "you": up to six on the inner ring, the rest on the outer one.
+function ringPosition(i, total) {
+  const ring = i < 6 ? 0 : 1;
+  const count = ring ? total - 6 : Math.min(total, 6);
+  const index = ring ? i - 6 : i;
+  return { ring, angle: (index * 360) / count + (ring ? 30 : 0) };
 }
 
 function renderDevices() {
@@ -168,21 +190,42 @@ function renderDevices() {
   const select = $("#text-target");
   const previous = select.value;
   select.replaceChildren();
-  for (const d of devices) {
-    const card = el("div", { class: "card drop" },
+  const paired = loadZone();
+  box.classList.toggle("big", devices.length + 1 > 6);
+  box.append(el("div", { class: "me" },
+    el("div", { class: "avatar" }, (alias[0] || "?").toUpperCase()),
+    el("div", { class: "name" }, alias),
+    el("div", { class: "meta" }, paired ? "Visible to your paired devices" : "Not paired yet")));
+
+  const total = devices.length + 1;                       // the pairing bubble takes a place too
+  const place = (node, i) => {
+    const { ring, angle } = ringPosition(i, total);
+    node.setAttribute("style", `--a:${angle}deg;--r:var(--r${ring})`);
+    return node;
+  };
+  devices.forEach((d, i) => {
+    const status = d.online ? "Available" : `Last seen ${ago(d.seen)}`;
+    const bubble = el("div", { class: d.online ? "device card drop" : "device offline" },
+      el("div", { class: "avatar", style: `--hue:${hueOf(d.pubkey)}` }, (d.name[0] || "?").toUpperCase()),
       el("div", { class: "name" }, d.name),
-      el("div", { class: "meta" }, "Browser (WebRTC)"),
-      el("span", { class: "badge" }, "WebRTC"));
-    makeDropTarget(card, (files) => sendFiles(d, files));
-    box.append(card);
-    select.append(el("option", { value: d.pubkey }, d.name));
-  }
+      el("div", { class: "meta" }, status));
+    if (d.online) {
+      makeDropTarget(bubble, (files) => sendFiles(d, files));
+      select.append(el("option", { value: d.pubkey }, d.name));
+    } else {
+      bubble.title = "Offline. It appears here as soon as its page is open.";
+    }
+    box.append(place(bubble, i));
+  });
+  const add = el("div", { class: "device pairbubble", title: "Pair a device" },
+    el("div", { class: "avatar" }, "+"),
+    el("div", { class: "name" }, "Pair a device"));
+  add.addEventListener("click", () => {
+    $("#pair-section").scrollIntoView({ behavior: "smooth" });
+    $("#pair-code").focus();
+  });
+  box.append(place(add, devices.length));
   if (previous) select.value = previous;
-  if (!devices.length) {
-    box.append(el("p", { class: "hint" }, loadZone()
-      ? "No paired device is online right now. Paired devices appear here whenever their page is open."
-      : "No paired devices yet. Pair one with a code or QR above."));
-  }
 }
 
 function makeDropTarget(card, onFiles) {
@@ -363,7 +406,18 @@ function init() {
   document.querySelectorAll(".alias").forEach((e) => { e.textContent = `“${alias}”`; });
   showStatus("connecting …");
 
-  $("#refresh").addEventListener("click", refreshDevices);
+  const nameInput = $("#alias-input");
+  nameInput.value = alias;
+  nameInput.addEventListener("change", () => {
+    const name = nameInput.value.trim().slice(0, 40);
+    if (!name) { nameInput.value = alias; return; }
+    alias = name;
+    localStorage.setItem(LS_ALIAS, name);
+    showStatus(`Ready – visible as “${alias}”`);
+    wire.setAlias(name);
+    refreshDevices();
+  });
+  setInterval(refreshDevices, 60000);                     // keeps "last seen" fresh
   $("#pair-show").addEventListener("click", showHostCode);
   $("#pair-cancel").addEventListener("click", () => { hideHostCode(); showPairState(""); renderZoneState(); });
   $("#pair-join").addEventListener("submit", (ev) => {

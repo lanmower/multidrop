@@ -46,6 +46,22 @@ function saveZone(zone) {
   else localStorage.removeItem(ZONE_KEY);
 }
 
+const MEMBER_FRESH_MS = 60000;           // do not rewrite a member's last-seen more often than this
+
+// Paired devices are remembered with the zone, so they stay listed while offline.
+function rememberMember(pk, name) {
+  const zone = loadZone();
+  if (!zone) return false;
+  const members = zone.members || {};
+  const now = Date.now();
+  if (name === pk.slice(0, 8)) return false;              // wireweave's placeholder, not a real name
+  const known = members[pk];
+  if (known && known.name === name && now - known.seen < MEMBER_FRESH_MS) return false;
+  members[pk] = { name, seen: now };
+  saveZone({ ...zone, members });
+  return true;
+}
+
 export function createWire({ alias, onEvent }) {
   // Relays that store and return kind-30078 events reliably (checked per relay);
   // the wireweave default list includes several that drop them.
@@ -60,7 +76,14 @@ export function createWire({ alias, onEvent }) {
   const cancelled = new Set();
   let pairing = null;                // {session, role, peer, name, ttl, ack}
 
-  const nameOf = (pk) => data.participants.get("nostr-" + pk.slice(0, 12))?.identity || pk.slice(0, 8);
+  // Names come straight from the device over the data channel (sent on connect and on
+  // rename); wireweave's presence name is only a fallback, as it is set once per device.
+  const names = new Map();
+  const nameOf = (pk) =>
+    names.get(pk) || data.participants.get("nostr-" + pk.slice(0, 12))?.identity || pk.slice(0, 8);
+  const announceName = (pk) => {
+    try { sendControl(pk, { k: "name", name: alias }); } catch { /* the peer is gone; it asks again on reconnect */ }
+  };
 
   const sendControl = (pk, msg) => {
     if (!data.send(pk, JSON.stringify(msg))) throw new Error("device is not connected");
@@ -144,6 +167,14 @@ export function createWire({ alias, onEvent }) {
         emit({ event: "file_received", from: nameOf(pk), file: rx.name, size: blob.size, url: URL.createObjectURL(blob) });
         return;
       }
+      case "name": {
+        const name = typeof msg.name === "string" ? msg.name.trim().slice(0, 40) : "";
+        if (!name) return;
+        names.set(pk, name);
+        rememberMember(pk, name);
+        emit({ event: "devices" });
+        return;
+      }
       case "text":
         emit({ event: "message", from: nameOf(pk), kind: /^https?:\/\//i.test(msg.text) ? "url" : "text", text: msg.text });
         return;
@@ -177,7 +208,11 @@ export function createWire({ alias, onEvent }) {
   data.addEventListener("connected", () => emit({ event: "connected" }));
   data.addEventListener("participants", () => emit({ event: "devices" }));
   data.addEventListener("error", (e) => emit({ event: "error", message: e.detail.message }));
-  data.addEventListener("peer-open", (e) => { if (!e.detail.unreliable) emit({ event: "devices" }); });
+  data.addEventListener("peer-open", (e) => {
+    if (e.detail.unreliable) return;
+    announceName(e.detail.peerPubkey);
+    emit({ event: "devices" });
+  });
   data.addEventListener("peer-close", (e) => {
     const pk = e.detail.peerPubkey;
     if (e.detail.unreliable) return;
@@ -191,6 +226,12 @@ export function createWire({ alias, onEvent }) {
     receiving.delete(pk);
     emit({ event: "devices" });
   });
+
+  function onlineDevices() {
+    return [...data.peers.keys()]
+      .filter((pk) => data.peers.get(pk).dc?.readyState === "open")
+      .map((pk) => ({ pubkey: pk, name: nameOf(pk) }));
+  }
 
   function startJob(pk, info, files) {
     const job = { id: newId(), pubkey: pk, info, files, state: "waiting" };
@@ -249,6 +290,7 @@ export function createWire({ alias, onEvent }) {
     if (msg.k === "zone" && p.role === "joiner") {
       p.paired = true;                          // the close that follows is not a lost connection
       saveZone({ secret: msg.secret, host: msg.host, joined: Date.now() });
+      rememberMember(pk, msg.host);
       p.session.send(pk, JSON.stringify({ k: "paired" }));
       emit({ event: "paired", name: msg.host });
       joinZone(msg.secret).catch((e) => emit({ event: "error", message: `zone: ${e.message}` }));
@@ -296,6 +338,7 @@ export function createWire({ alias, onEvent }) {
     }
     const zone = loadZone() || { secret: newZoneSecret(), host: alias, joined: Date.now() };
     saveZone(zone);
+    rememberMember(p.peer, p.name);
     p.session.send(p.peer, JSON.stringify({ k: "zone", secret: zone.secret, host: alias }));
     p.ack = setTimeout(() => { if (pairing === p) { emit({ event: "pair_done", name: p.name }); closePairing(); } }, PAIR_ACK_MS);
     await joinZone(zone.secret);
@@ -329,10 +372,29 @@ export function createWire({ alias, onEvent }) {
     closePairing,
     answerPair,
 
-    devices() {
-      return [...data.peers.keys()]
-        .filter((pk) => data.peers.get(pk).dc?.readyState === "open")
-        .map((pk) => ({ pubkey: pk, name: nameOf(pk) }));
+    devices: onlineDevices,
+
+    // Every paired device, online or not, as if it were in the room.
+    members() {
+      const out = new Map();
+      for (const [pk, m] of Object.entries(loadZone()?.members || {})) {
+        out.set(pk, { pubkey: pk, name: m.name, online: false, seen: m.seen });
+      }
+      for (const d of onlineDevices()) {
+        const remembered = out.get(d.pubkey)?.name;
+        const name = d.name === d.pubkey.slice(0, 8) && remembered ? remembered : d.name;
+        out.set(d.pubkey, { pubkey: d.pubkey, name, online: true, seen: Date.now() });
+        rememberMember(d.pubkey, name);
+      }
+      return [...out.values()];
+    },
+
+    // Changes the name other devices see: told to every connected device at once,
+    // and used for later presence and pairing messages.
+    setAlias(name) {
+      alias = name;
+      data.displayName = name;
+      for (const d of onlineDevices()) announceName(d.pubkey);
     },
 
     sendFiles(pk, entries, label) {
