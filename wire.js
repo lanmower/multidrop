@@ -20,6 +20,7 @@ const RELAYS = [
 ];
 const ZONE_KEY = "multidrop-zone";
 const CHUNK = 64 * 1024;                 // well under the message limit browsers accept
+const WINDOW = 8 * CHUNK;                // unacknowledged bytes a sender may have in flight
 const MAX_BUFFERED = 4 * 1024 * 1024;    // pause sending while the channel is this full
 const PAIR_TTL_MS = 5 * 60 * 1000;       // a shown code stops working after this
 const PAIR_ACK_MS = 5000;                // host waits this long for the joiner's ack
@@ -28,6 +29,26 @@ const STALE_MS = 30000;                  // a peer that has not opened by then i
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const newId = () => crypto.randomUUID().slice(0, 12);
 const baseName = (p) => p.split(/[\\/]/).filter(Boolean).pop() || "file";
+
+// Receiving streams straight to a folder the user picks (File System Access API);
+// nothing is held in memory or stored on the page. Chromium-based browsers only.
+export const canReceiveToFolder = () => typeof window.showDirectoryPicker === "function";
+
+// A name that is free in the folder: "photo.jpg", then "photo (1).jpg", and so on.
+async function freeFileHandle(dir, name) {
+  const dot = name.lastIndexOf(".");
+  const stem = dot > 0 ? name.slice(0, dot) : name;
+  const ext = dot > 0 ? name.slice(dot) : "";
+  for (let i = 0; ; i++) {
+    const candidate = i ? `${stem} (${i})${ext}` : name;
+    try {
+      await dir.getFileHandle(candidate);
+    } catch (e) {
+      if (e.name === "NotFoundError") return dir.getFileHandle(candidate, { create: true });
+      throw e;
+    }
+  }
+}
 const hex = (bytes) => [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
 const sha256Hex = async (text) =>
   hex(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text))));
@@ -70,8 +91,9 @@ export function createWire({ alias, onEvent }) {
   const emit = (ev) => onEvent(ev);
 
   const outgoing = new Map();        // job id -> {id, pubkey, info, files: [{fid, name, file}], state}
-  const incoming = new Map();        // offer id -> {pubkey, files}
-  const receiving = new Map();       // pubkey -> file currently arriving {id, fid, name, size, parts, got}
+  const incoming = new Map();        // offer id -> {pubkey, files}, waiting for our answer
+  const accepted = new Map();        // offer id -> {pubkey, dir, fileIds}, answered yes
+  const receiving = new Map();       // pubkey -> file being written {id, fid, name, size, got, written, writable, queue}
   const queues = new Map();          // pubkey -> tail of that peer's transfer queue
   const cancelled = new Set();
   let pairing = null;                // {session, role, peer, name, ttl, ack}
@@ -87,6 +109,11 @@ export function createWire({ alias, onEvent }) {
 
   const sendControl = (pk, msg) => {
     if (!data.send(pk, JSON.stringify(msg))) throw new Error("device is not connected");
+  };
+
+  const assertOpen = (pk) => {
+    const dc = data.peers.get(pk)?.dc;
+    if (!dc || dc.readyState !== "open") throw new Error("device disconnected");
   };
 
   const drain = async (pk) => {
@@ -113,6 +140,13 @@ export function createWire({ alias, onEvent }) {
         for (let off = 0; off < f.file.size; off += CHUNK) {
           if (cancelled.has(job.id)) throw new Error("cancelled");
           await drain(job.pubkey);
+          // Flow control: stop while too much is unacknowledged, so a slow disk
+          // on the receiving side never has to buffer the rest of the file.
+          while (done - (job.acked.get(f.fid) || 0) >= WINDOW) {
+            if (cancelled.has(job.id)) throw new Error("cancelled");
+            assertOpen(job.pubkey);
+            await sleep(10);
+          }
           const buf = await f.file.slice(off, off + CHUNK).arrayBuffer();
           if (!data.send(job.pubkey, buf)) throw new Error("device disconnected");
           done += buf.byteLength;
@@ -156,15 +190,35 @@ export function createWire({ alias, onEvent }) {
         emit({ event: "job_failed", job: msg.id, error: "declined by receiver" });
         return;
       }
-      case "file":
-        receiving.set(pk, { id: msg.id, fid: msg.fid, name: baseName(msg.name), size: msg.size, parts: [], got: 0 });
+      case "ack": {
+        const job = outgoing.get(msg.id);
+        if (!job || job.pubkey !== pk) return;
+        job.acked.set(msg.fid, Math.max(job.acked.get(msg.fid) || 0, msg.n));
         return;
+      }
+      case "file": {
+        const acc = accepted.get(msg.id);
+        if (!acc || acc.pubkey !== pk || !acc.fileIds.includes(msg.fid)) return;
+        const rx = { id: msg.id, fid: msg.fid, name: baseName(msg.name), size: msg.size, got: 0, written: 0, error: null };
+        rx.queue = (async () => {
+          try {
+            const handle = await freeFileHandle(acc.dir, rx.name);
+            rx.writable = await handle.createWritable();
+          } catch (e) { rx.error = e; }
+        })();
+        receiving.set(pk, rx);
+        return;
+      }
       case "end": {
         const rx = receiving.get(pk);
-        receiving.delete(pk);
         if (!rx || rx.fid !== msg.fid) return;
-        const blob = new Blob(rx.parts, { type: "application/octet-stream" });
-        emit({ event: "file_received", from: nameOf(pk), file: rx.name, size: blob.size, url: URL.createObjectURL(blob) });
+        receiving.delete(pk);
+        rx.queue = rx.queue.then(async () => {
+          if (rx.error) throw rx.error;
+          if (rx.written !== rx.size) throw new Error("incomplete");
+          await rx.writable.close();
+          emit({ event: "file_saved", from: nameOf(pk), file: rx.name, size: rx.size });
+        }).catch((e) => failReceive(pk, rx, e));
         return;
       }
       case "name": {
@@ -178,23 +232,53 @@ export function createWire({ alias, onEvent }) {
       case "text":
         emit({ event: "message", from: nameOf(pk), kind: /^https?:\/\//i.test(msg.text) ? "url" : "text", text: msg.text });
         return;
-      case "cancel":
+      case "cancel": {
+        // The receiver stopped a file we were sending.
+        const job = outgoing.get(msg.id);
+        if (job && job.pubkey === pk && !cancelled.has(job.id)) {
+          cancelled.add(job.id);
+          outgoing.delete(job.id);
+          emit({ event: "job_failed", job: job.id, error: "receiver stopped" });
+        }
+        // The sender cancelled: drop the offer or the file being written.
         incoming.delete(msg.id);
-        if (receiving.get(pk)?.id === msg.id) receiving.delete(pk);
+        accepted.delete(msg.id);
+        const rx = receiving.get(pk);
+        if (rx?.id === msg.id) { receiving.delete(pk); abortReceive(rx); }
         emit({ event: "offer_withdrawn", id: msg.id });
         return;
+      }
     }
+  }
+
+  function abortReceive(rx) {
+    rx.writable?.abort().catch(() => {});                // a partial file is discarded
+  }
+
+  function failReceive(pk, rx, e) {
+    if (receiving.get(pk) === rx) receiving.delete(pk);
+    abortReceive(rx);
+    try { sendControl(pk, { k: "cancel", id: rx.id }); } catch {}
+    emit({ event: "error", message: `${rx.name}: ${e.message || e}` });
   }
 
   function onChunk(pk, buf) {
     const rx = receiving.get(pk);
     if (!rx) return;
-    rx.parts.push(buf);
     rx.got += buf.byteLength;
     if (rx.got > rx.size) {
       receiving.delete(pk);
+      abortReceive(rx);
       emit({ event: "error", message: `${rx.name}: more data than announced` });
+      return;
     }
+    // Written in arrival order; each write is acknowledged so the sender can go on.
+    rx.queue = rx.queue.then(async () => {
+      if (rx.error) throw rx.error;
+      await rx.writable.write(buf);
+      rx.written += buf.byteLength;
+      sendControl(pk, { k: "ack", id: rx.id, fid: rx.fid, n: rx.written });
+    }).catch((e) => failReceive(pk, rx, e));
   }
 
   data.addEventListener("data", (e) => {
@@ -223,7 +307,9 @@ export function createWire({ alias, onEvent }) {
       outgoing.delete(job.id);
       emit({ event: "job_failed", job: job.id, error: "connection closed" });
     }
-    receiving.delete(pk);
+    const rx = receiving.get(pk);
+    if (rx) { receiving.delete(pk); abortReceive(rx); }
+    for (const [id, a] of accepted) if (a.pubkey === pk) accepted.delete(id);
     emit({ event: "devices" });
   });
 
@@ -234,7 +320,7 @@ export function createWire({ alias, onEvent }) {
   }
 
   function startJob(pk, info, files) {
-    const job = { id: newId(), pubkey: pk, info, files, state: "waiting" };
+    const job = { id: newId(), pubkey: pk, info, files, state: "waiting", acked: new Map() };
     outgoing.set(job.id, job);
     emit({ event: "job_started", job: job.id, info });
     return job;
@@ -420,12 +506,15 @@ export function createWire({ alias, onEvent }) {
       }
     },
 
-    answer(id, accept, fileIds = []) {
+    // dir: the folder the files are streamed into (a FileSystemDirectoryHandle).
+    answer(id, accept, fileIds = [], dir = null) {
       const offer = incoming.get(id);
       if (!offer) return;
       incoming.delete(id);
+      const yes = accept && fileIds.length && dir;
+      if (yes) accepted.set(id, { pubkey: offer.pubkey, dir, fileIds });
       try {
-        sendControl(offer.pubkey, accept && fileIds.length ? { k: "accept", id, files: fileIds } : { k: "decline", id });
+        sendControl(offer.pubkey, yes ? { k: "accept", id, files: fileIds } : { k: "decline", id });
       } catch (e) {
         emit({ event: "error", message: `answer failed: ${e.message}` });
       }

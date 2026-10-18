@@ -1,7 +1,7 @@
 // MultiDrop web build (GitHub Pages). The same screens as daemon/web/app.js,
 // on AnEntrypoint/wireweave instead of the local daemon. Peer-supplied strings
 // (device and file names, texts) are always inserted as text, never as HTML.
-import { createWire, newPairCode, loadZone } from "./wire.js";
+import { createWire, newPairCode, loadZone, canReceiveToFolder } from "./wire.js";
 import qrcode from "qrcode-generator";
 
 const $ = (sel) => document.querySelector(sel);
@@ -19,7 +19,7 @@ function el(tag, attrs = {}, ...children) {
   for (const [k, v] of Object.entries(attrs)) {
     if (k === "class") e.className = v;
     else if (k.startsWith("on")) e.addEventListener(k.slice(2), v);
-    else e.setAttribute(k, v);
+    else if (v !== null && v !== undefined) e.setAttribute(k, v);
   }
   for (const c of children) e.append(c instanceof Node ? c : String(c ?? ""));
   return e;
@@ -132,12 +132,7 @@ function renderOffers() {
       cb.checked = !off.has(f.id);
       items.append(el("li", {}, el("label", {}, cb, " ", label)));
     }
-    const answer = (accept, ids) => {
-      wire.answer(o.id, accept, ids);
-      offers = offers.filter((x) => x.id !== o.id);
-      unchecked.delete(o.id);
-      renderOffers();
-    };
+    const answer = (accept, ids) => acceptOffer(o, accept ? ids : []);
     const everyFile = o.files.map((f) => f.id);
     const chosen = () => everyFile.filter((id) => !off.has(id));
     box.append(el("div", { class: "card offer" },
@@ -145,14 +140,35 @@ function renderOffers() {
       el("div", { class: "meta" }, `Browser (WebRTC) · ${human(o.total_size)}`),
       items,
       el("div", { class: "row" },
-        el("button", { class: "primary", type: "button", onclick: () => answer(true, everyFile) },
-           selectable ? "Accept all" : "Accept"),
-        selectable ? el("button", { type: "button", "data-action": "accept-selected", onclick: () => {
+        el("button", { class: "primary", type: "button", disabled: canReceiveToFolder() ? undefined : "",
+           onclick: () => answer(true, everyFile) }, selectable ? "Accept all" : "Accept"),
+        selectable ? el("button", { type: "button", "data-action": "accept-selected",
+          disabled: canReceiveToFolder() ? undefined : "", onclick: () => {
           const ids = chosen();
           if (ids.length) answer(true, ids); else answer(false);
         } }, "Accept selected") : "",
-        el("button", { class: "danger", type: "button", onclick: () => answer(false) }, "Decline"))));
+        el("button", { class: "danger", type: "button", onclick: () => answer(false) }, "Decline")),
+      canReceiveToFolder() ? "" : el("p", { class: "hint" },
+        "Receiving needs Chrome, Edge or Opera: files are written straight to a folder you choose.")));
   }
+}
+
+// Accepting picks the folder first: the picker must open inside the click, so the
+// call starts synchronously. Files then stream into that folder, never into memory.
+async function acceptOffer(o, ids) {
+  let dir = null;
+  if (ids.length) {
+    try {
+      dir = await window.showDirectoryPicker({ mode: "readwrite", id: "multidrop" });
+    } catch {
+      dir = null;                                         // picker cancelled
+    }
+  }
+  wire.answer(o.id, Boolean(dir), ids, dir);
+  offers = offers.filter((x) => x.id !== o.id);
+  unchecked.delete(o.id);
+  renderOffers();
+  if (dir) addLog(`Saving ${ids.length} file(s) from ${o.from} into “${dir.name}”`);
 }
 
 // -- devices and sending --------------------------------------------------
@@ -378,9 +394,8 @@ function onEvent(ev) {
       offers = offers.filter((o) => o.id !== ev.id);
       renderOffers();
       break;
-    case "file_received":
-      addLog(el("span", {}, `received ${ev.file} from ${ev.from} (${human(ev.size)}) · `,
-        el("a", { href: ev.url, download: ev.file }, "save")));
+    case "file_saved":
+      addLog(`saved ${ev.file} from ${ev.from} (${human(ev.size)})`);
       break;
     case "message":
       addLog(`${ev.kind === "url" ? "Link" : "Text"} from ${ev.from}: ${ev.text}`);
