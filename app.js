@@ -12,6 +12,7 @@ let offers = [];               // incoming offers, oldest first
 let pendingPair = null;        // {name} while a joiner waits for approval (host side)
 let devices = [];              // paired devices, online or not
 let nearbyList = [];           // unpaired devices on this network, online
+let deviceByPk = new Map();    // online devices by key, for the text sender
 let wire = null;
 let alias = "";
 let folder = null;             // the receive folder handle, once chosen
@@ -223,7 +224,7 @@ function renderOffers() {
     const chosen = () => everyFile.filter((id) => !off.has(id));
     box.append(el("div", { class: "card offer" },
       el("div", { class: "name" }, `${o.from} wants to send`),
-      el("div", { class: "meta" }, `Browser (WebRTC) · ${human(o.total_size)}`),
+      el("div", { class: "meta" }, `${o.via === "relay" ? "Via encrypted relays" : "Browser (WebRTC)"} · ${human(o.total_size)}`),
       items,
       el("div", { class: "row" },
         el("button", { class: "primary", type: "button", disabled: canReceiveToFolder() ? undefined : "",
@@ -296,6 +297,25 @@ function ringPosition(i, total) {
   return { ring, angle: (index * 360) / count + (ring ? 30 : 0) };
 }
 
+// Where a device sits on the radar: paired devices, and nearby ones that share the
+// Wi-Fi or are close by, sit on the inner ring; the rest on the outer one.
+function layout(items) {
+  const inner = items.filter((d) => !d.nearby || d.lan || (d.rtt != null && d.rtt < 20));
+  const outer = items.filter((d) => !inner.includes(d));
+  const at = new Map();
+  inner.forEach((d, i) => at.set(d, { ring: 0, angle: (i * 360) / inner.length }));
+  outer.forEach((d, i) => at.set(d, { ring: 1, angle: (i * 360) / outer.length + 30 }));
+  return at;
+}
+
+function reachLabel(d) {
+  if (!d.online) return `Last seen ${ago(d.seen)}`;
+  if (!d.nearby) return d.reach === "relay" ? "Via relays" : "Available";
+  if (d.reach === "relay") return "Via relays";
+  if (d.lan) return d.rtt != null ? `On your Wi-Fi · ${d.rtt} ms` : "On your Wi-Fi";
+  return d.rtt != null ? `Same network · ${d.rtt} ms` : "Same network";
+}
+
 function renderDevices() {
   const box = $("#devices");
   box.replaceChildren();
@@ -308,51 +328,64 @@ function renderDevices() {
     el("div", { class: "name" }, alias),
     el("div", { class: "meta" }, paired ? "Visible to your paired devices" : "Not paired yet")));
 
-  const all = [
+  const items = [
     ...devices.map((d) => ({ ...d, nearby: false })),
     ...nearbyList.map((d) => ({ ...d, nearby: true })),
   ];
-  box.classList.toggle("big", all.length + 1 > 6);
+  const sendable = items.filter((d) => d.online);
+  deviceByPk = new Map(sendable.map((d) => [d.pubkey, d]));
 
   // The text target lists only devices that are online right now; with none,
   // the control is disabled and says why, instead of showing an empty dropdown.
-  const online = all.filter((d) => d.online);
-  select.disabled = online.length === 0;
-  $("#text-form button[type=submit]").disabled = online.length === 0;
-  if (!online.length) select.append(el("option", { value: "" }, paired ? "No paired device is online" : "Pair a device first"));
+  select.disabled = sendable.length === 0;
+  $("#text-form button[type=submit]").disabled = sendable.length === 0;
+  if (!sendable.length) select.append(el("option", { value: "" }, paired ? "No paired device is online" : "Pair a device first"));
+  for (const d of sendable) select.append(el("option", { value: d.pubkey }, d.reach === "relay" ? `${d.name} (via relays)` : d.name));
 
-  const place = (node, i, total) => {
-    const { ring, angle } = ringPosition(i, total);
-    node.setAttribute("style", `--a:${angle}deg;--r:var(--r${ring})`);
-    return node;
-  };
-  const total = all.length + 1;                           // the pairing bubble takes a place too
-  all.forEach((d, i) => {
-    const status = d.online
-      ? (d.nearby ? "Nearby" : "Available")
-      : `Last seen ${ago(d.seen)}`;
-    const bubble = el("div", { class: [d.online ? "device card drop" : "device offline", d.nearby ? "nearby" : ""].join(" ").trim() },
-      el("div", { class: "avatar", style: `--hue:${hueOf(d.pubkey)}` }, (d.name[0] || "?").toUpperCase()),
-      el("div", { class: "name" }, d.name),
-      el("div", { class: "meta" }, status));
-    if (d.online) {
-      makeDropTarget(bubble, (files) => sendFiles(d, files));
-      select.append(el("option", { value: d.pubkey }, d.name));
+  const add = { pubkey: "", add: true, nearby: false };
+  const all = [...items, add];
+  box.classList.toggle("big", all.length > 6);
+  const at = layout(all);
+  for (const d of all) {
+    const spot = at.get(d);
+    const node = d.add
+      ? el("div", { class: "device pairbubble", title: "Pair a device" },
+          el("div", { class: "avatar" }, "+"), el("div", { class: "name" }, "Pair a device"))
+      : el("div", { class: [
+            d.online ? "device card drop" : "device offline",
+            d.nearby ? "nearby" : "",
+            d.reach === "relay" ? "relay" : "",
+          ].join(" ").replace(/\s+/g, " ").trim() },
+          el("div", { class: "avatar", style: `--hue:${hueOf(d.pubkey)}` }, (d.name[0] || "?").toUpperCase()),
+          el("div", { class: "name" }, d.name),
+          el("div", { class: "meta" }, reachLabel(d)));
+    if (d.add) {
+      node.addEventListener("click", () => {
+        $("#pair-section").scrollIntoView({ behavior: "smooth" });
+        $("#pair-code").focus();
+      });
+    } else if (d.online) {
+      makeDropTarget(node, (files) => sendTo(d, files));
     } else {
-      bubble.title = "Offline. It appears here as soon as its page is open.";
+      node.title = "Offline. It appears here as soon as its page is open.";
     }
-    box.append(place(bubble, i, total));
-  });
-  const add = el("div", { class: "device pairbubble", title: "Pair a device" },
-    el("div", { class: "avatar" }, "+"),
-    el("div", { class: "name" }, "Pair a device"));
-  add.addEventListener("click", () => {
-    $("#pair-section").scrollIntoView({ behavior: "smooth" });
-    $("#pair-code").focus();
-  });
-  box.append(place(add, all.length, total));
-  if (previous) select.value = previous;
+    node.setAttribute("style", `--a:${spot.angle}deg;--r:var(--r${spot.ring})`);
+    box.append(node);
+  }
+  if (previous && deviceByPk.has(previous)) select.value = previous;
   renderNetwork();
+}
+
+// Direct when the device is reachable on the local link; otherwise the user is asked
+// before anything goes through the encrypted relays.
+function sendTo(d, files) {
+  if (d.reach !== "relay") return sendFiles(d, files, "direct");
+  const total = files.reduce((sum, f) => sum + f.file.size, 0);
+  const ok = window.confirm(
+    `${d.name} cannot be reached directly right now.\n\n` +
+    `Send ${files.length} file(s), ${human(total)}, through encrypted relays instead? ` +
+    "It is slower, and the relays see when and how much is sent, never the contents.");
+  if (ok) sendFiles(d, files, "relay");
 }
 
 function makeDropTarget(card, onFiles) {
@@ -397,11 +430,11 @@ async function filesFromDrop(dt) {
   return out;
 }
 
-function sendFiles(device, files) {
+function sendFiles(device, files, via) {
   const total = files.reduce((s, f) => s + f.file.size, 0);
-  addLog(`Handing over ${files.length} file(s), ${human(total)} to ${device.name} …`);
+  addLog(`Handing over ${files.length} file(s), ${human(total)} to ${device.name}${via === "relay" ? " via encrypted relays" : ""} …`);
   try {
-    wire.sendFiles(device.pubkey, files, device.name);
+    wire.sendFiles(device.pubkey, files, device.name, via);
   } catch (e) {
     addLog(`Sending to ${device.name} failed: ${e.message}`);
   }
@@ -576,7 +609,8 @@ function init() {
     const label = select.selectedOptions[0].textContent;
     const text = $("#text").value.trim();
     if (!text) return;
-    wire.sendText(pk, text, label);
+    const target = deviceByPk.get(pk);
+    wire.sendText(pk, text, label, target?.reach === "relay" ? "relay" : "direct");
     $("#text").value = "";
   });
 
@@ -584,6 +618,7 @@ function init() {
   renderJobs();
 
   wire = createWire({ alias, onEvent });
+  if (new URLSearchParams(location.search).has("debug")) window.multidrop = { wire };   // test hook
   window.addEventListener("pagehide", () => { wire.leave(); });
 
   // Keys must exist before any room is joined, so join first; a pairing link (QR code)
