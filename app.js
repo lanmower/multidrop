@@ -132,6 +132,7 @@ const pageUrl = (params) => `${location.origin}${location.pathname}${params}`;
 
 function showStatus(text) {
   $("#status").textContent = text;
+  $("#status").classList.toggle("ready", text.startsWith("Ready"));
 }
 
 // -- pairing --------------------------------------------------------------
@@ -296,6 +297,13 @@ function renderDevices() {
     el("div", { class: "avatar" }, (alias[0] || "?").toUpperCase()),
     el("div", { class: "name" }, alias),
     el("div", { class: "meta" }, paired ? "Visible to your paired devices" : "Not paired yet")));
+
+  // The text target lists only devices that are online right now; with none,
+  // the control is disabled and says why, instead of showing an empty dropdown.
+  const online = devices.filter((d) => d.online);
+  select.disabled = online.length === 0;
+  $("#text-form button[type=submit]").disabled = online.length === 0;
+  if (!online.length) select.append(el("option", { value: "" }, paired ? "No paired device is online" : "Pair a device first"));
 
   const total = devices.length + 1;                       // the pairing bubble takes a place too
   const place = (node, i) => {

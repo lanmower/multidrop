@@ -68,15 +68,15 @@ summary { cursor: pointer; color: var(--muted); }
 .alias-edit { margin-left: auto; display: flex; align-items: center; gap: .5rem;
               color: var(--muted); font-size: .85rem; }
 .alias-edit input { width: 11rem; }
-.stage { --r0: min(9rem, 29vw); --r1: min(15rem, 45vw); position: relative; height: 28rem;
+.stage { --r0: min(10rem, 28vw); --r1: min(14.5rem, 40vw); position: relative; height: 31rem;
          margin: .5rem 0; border-radius: 16px; overflow: hidden;
          background:
            radial-gradient(circle at 50% 50%, transparent calc(var(--r0) - 1px), var(--line) var(--r0),
                            transparent calc(var(--r0) + 1px)),
            radial-gradient(circle at 50% 50%, transparent calc(var(--r1) - 1px), var(--line) var(--r1),
                            transparent calc(var(--r1) + 1px)); }
-.stage.big { height: 42rem; }
-.me, .device { position: absolute; left: 50%; top: 50%; text-align: center; width: 7.5rem; }
+.stage.big { height: 36rem; }
+.me, .device { position: absolute; left: 50%; top: 50%; text-align: center; width: 9rem; }
 .me { transform: translate(-50%, -50%); }
 .device { transform: translate(-50%, -50%) rotate(var(--a)) translateY(calc(-1 * var(--r)))
                      rotate(calc(-1 * var(--a))); }
@@ -105,3 +105,30 @@ summary { cursor: pointer; color: var(--muted); }
 #offers-section h2 { display: none; }
 #offers .card.offer { margin: 0 0 .5rem; border-radius: 16px; border-left-width: 1px;
                       box-shadow: 0 10px 34px rgba(0, 0, 0, .3); }
+
+/* Polish: focus, disabled and responsive states. */
+header { flex-wrap: wrap; row-gap: .4rem; }
+#status { display: inline-flex; align-items: center; gap: .45rem; }
+#status::before { content: ""; width: .5rem; height: .5rem; border-radius: 50%;
+                  background: var(--muted); flex: none; }
+#status.ready::before { background: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 22%, transparent); }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+button, input, select, textarea { transition: background .15s, border-color .15s, opacity .15s; }
+button:active:not(:disabled) { transform: translateY(1px); }
+button.primary:hover:not(:disabled) { filter: brightness(1.07); }
+button:hover:not(:disabled):not(.primary) { border-color: var(--accent); }
+button:disabled, input:disabled, select:disabled { opacity: .45; cursor: not-allowed; }
+select { min-width: 12rem; }
+.hint:empty { display: none; }
+#text-form textarea { max-width: 100%; }
+.card.offer .meta { margin-bottom: .4rem; }
+@media (max-width: 40rem) {
+  header { padding: .9rem 1rem; }
+  main { padding: 1rem 1rem 6rem; }
+  .alias-edit { margin-left: 0; width: 100%; }
+  .alias-edit input { flex: 1; width: auto; }
+  .stage { --r0: 8.25rem; --r1: 12rem; height: 26rem; }
+  .stage.big { height: 30rem; }
+  .me, .device { width: 7.5rem; }
+  .avatar { width: 3.6rem; height: 3.6rem; font-size: 1.2rem; }
+}
