@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<link rel="icon" href="data:,">
+<title>MultiDrop</title>
+<link rel="stylesheet" href="style.css">
+<script type="importmap">
+{
+  "imports": {
+    "nostr-tools": "https://esm.sh/nostr-tools@2.25.2",
+    "xstate": "https://esm.sh/xstate@5",
+    "qrcode-generator": "https://esm.sh/qrcode-generator@1.4.4"
+  }
+}
+</script>
+<script type="module" src="app.js"></script>
+</head>
+<body>
+<header>
+  <h1>MultiDrop</h1>
+  <div id="status">connecting …</div>
+</header>
+
+<main>
+  <section id="offers-section" hidden>
+    <h2>Incoming</h2>
+    <div id="offers"></div>
+  </section>
+
+  <section id="pair-section">
+    <h2>Pair devices</h2>
+    <p class="hint">Pair once. Paired devices stay in your zone and show up below from any page you open.</p>
+    <div id="pair-requests"></div>
+    <div class="row">
+      <button id="pair-show" type="button" class="primary">Show a pairing code</button>
+      <form id="pair-join" class="row">
+        <input id="pair-code" inputmode="numeric" pattern="[0-9 ]{6,7}" placeholder="6-digit code" autocomplete="off" aria-label="Pairing code" required>
+        <button type="submit">Pair</button>
+      </form>
+    </div>
+    <div id="pair-host" class="card" hidden>
+      <div class="name">Enter this code on the other device</div>
+      <div class="pin" id="pair-code-show"></div>
+      <div id="pair-qr"></div>
+      <p><a id="pair-url" target="_blank" rel="noreferrer"></a></p>
+      <p class="meta">Expires in 5 minutes. Or scan the code with the other device’s camera.</p>
+      <button id="pair-cancel" type="button">Cancel</button>
+    </div>
+    <p id="pair-state" class="meta"></p>
+    <button id="leave-zone" type="button" class="danger" hidden>Leave zone on this device</button>
+  </section>
+
+  <section>
+    <div class="row">
+      <h2>Devices</h2>
+      <button id="refresh" type="button">Search</button>
+    </div>
+    <p class="hint">Drop files or folders on a device – or click it and choose.</p>
+    <div id="devices" class="grid"></div>
+  </section>
+
+  <section>
+    <h2>Send text or a link</h2>
+    <form id="text-form">
+      <textarea id="text" rows="2" placeholder="Text or https://…" required></textarea>
+      <div class="row">
+        <select id="text-target"></select>
+        <button type="submit">Send</button>
+      </div>
+    </form>
+  </section>
+
+  <section>
+    <h2>Transfers</h2>
+    <div id="jobs"></div>
+  </section>
+
+  <section>
+    <h2>History</h2>
+    <ol id="log" reversed></ol>
+  </section>
+</main>
+
+<input type="file" id="pick-files" multiple hidden>
+</body>
+</html>
