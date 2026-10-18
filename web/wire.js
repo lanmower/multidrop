@@ -1,10 +1,16 @@
-// Browser transport for the GitHub Pages build. AnEntrypoint/wireweave carries
-// presence and WebRTC signalling over nostr relays; file bytes go over its ordered
-// data channel as JSON control frames plus binary chunks.
+// Browser transport for the MultiDrop web app and its desktop launcher.
+// AnEntrypoint/wireweave carries presence and WebRTC signalling over nostr relays;
+// file bytes go over its ordered data channel as JSON control frames plus binary chunks.
+//
+// Two links run side by side:
+//   zone    - paired devices share a secret, so they find each other from anywhere.
+//   nearby  - devices behind the same public address (the same router, Wi-Fi or
+//             office) find each other without pairing. ICE learns that address from
+//             a STUN server, so no server of ours is involved. Like AirDrop, nearby
+//             devices are visible; every transfer from them still needs an accept.
 //
 // Pairing: a 6-digit code names a short-lived pairing room. The host approves the
-// joiner, then sends a zone secret over the encrypted data channel. A zone is a
-// room that paired devices join on every page load, so they stay in it.
+// joiner, then sends a zone secret over the encrypted data channel.
 import { createWireweave } from "./vendor/wireweave/src/wireweave.js";
 import { createDataSession } from "./vendor/wireweave/src/data.js";
 import * as NostrTools from "nostr-tools";
@@ -18,6 +24,7 @@ const RELAYS = [
   "wss://nostr-pub.wellorder.net",
   "wss://relay.snort.social",
 ];
+const STUN = [{ urls: "stun:stun.l.google.com:19302" }, { urls: "stun:stun.cloudflare.com:3478" }];
 const ZONE_KEY = "multidrop-zone";
 const CHUNK = 64 * 1024;                 // well under the message limit browsers accept
 const WINDOW = 8 * CHUNK;                // unacknowledged bytes a sender may have in flight
@@ -25,10 +32,21 @@ const MAX_BUFFERED = 4 * 1024 * 1024;    // pause sending while the channel is t
 const PAIR_TTL_MS = 5 * 60 * 1000;       // a shown code stops working after this
 const PAIR_ACK_MS = 5000;                // host waits this long for the joiner's ack
 const STALE_MS = 30000;                  // a peer that has not opened by then is dropped
+const NETWORK_CHECK_MS = 120000;         // re-read the network address this often
+const MEMBER_FRESH_MS = 60000;           // do not rewrite a member's last-seen more often than this
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const newId = () => crypto.randomUUID().slice(0, 12);
 const baseName = (p) => p.split(/[\\/]/).filter(Boolean).pop() || "file";
+const hex = (bytes) => [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
+const sha256Hex = async (text) =>
+  hex(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text))));
+const zoneRoom = (secret) => sha256Hex(`zone:${secret}`);
+const nearbyRoom = (networkKey) => sha256Hex(`net:${networkKey}`);
+const pairRoom = (code) => sha256Hex(`pair:${code}`);
+const newZoneSecret = () => hex(crypto.getRandomValues(new Uint8Array(16)));
+
+export const newPairCode = () => String(100000 + (crypto.getRandomValues(new Uint32Array(1))[0] % 900000));
 
 // Receiving streams straight to a folder the user picks (File System Access API);
 // nothing is held in memory or stored on the page. Chromium-based browsers only.
@@ -49,14 +67,6 @@ async function freeFileHandle(dir, name) {
     }
   }
 }
-const hex = (bytes) => [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
-const sha256Hex = async (text) =>
-  hex(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text))));
-const zoneRoom = (secret) => sha256Hex(`zone:${secret}`);
-const pairRoom = (code) => sha256Hex(`pair:${code}`);
-const newZoneSecret = () => hex(crypto.getRandomValues(new Uint8Array(16)));
-
-export const newPairCode = () => String(100000 + (crypto.getRandomValues(new Uint32Array(1))[0] % 900000));
 
 export function loadZone() {
   try { return JSON.parse(localStorage.getItem(ZONE_KEY)); } catch { return null; }
@@ -66,8 +76,6 @@ function saveZone(zone) {
   if (zone) localStorage.setItem(ZONE_KEY, JSON.stringify(zone));
   else localStorage.removeItem(ZONE_KEY);
 }
-
-const MEMBER_FRESH_MS = 60000;           // do not rewrite a member's last-seen more often than this
 
 // Paired devices are remembered with the zone, so they stay listed while offline.
 function rememberMember(pk, name) {
@@ -83,43 +91,83 @@ function rememberMember(pk, name) {
   return true;
 }
 
+// The public address this network shows the internet, as a STUN server reports it.
+// Devices on the same router report the same address. Null when STUN cannot be reached.
+// `?network=` overrides it for testing two devices on one machine.
+async function networkKey() {
+  const forced = new URLSearchParams(location.search).get("network");
+  if (forced) return forced;
+  if (typeof RTCPeerConnection === "undefined") return null;
+  return new Promise((resolve) => {
+    const pc = new RTCPeerConnection({ iceServers: STUN });
+    let found = null;
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      pc.close();
+      resolve(found);
+    };
+    pc.onicecandidate = (e) => {
+      if (!e.candidate) return finish();
+      if (e.candidate.type === "srflx" && !found) {
+        found = e.candidate.address || e.candidate.candidate.split(" ")[4];
+      }
+    };
+    pc.createDataChannel("probe");
+    pc.createOffer().then((o) => pc.setLocalDescription(o)).catch(finish);
+    setTimeout(finish, 4000);
+  });
+}
+
 export function createWire({ alias, onEvent }) {
   // Relays that store and return kind-30078 events reliably (checked per relay);
   // the wireweave default list includes several that drop them.
   const ww = createWireweave({ nostrTools: NostrTools, xstate, relays: RELAYS });
-  const data = ww.ensureData({ namespace: NAMESPACE });   // the zone session
+  const zone = ww.ensureData({ namespace: NAMESPACE });
+  const nearby = createDataSession({ fsm: ww.fsm, xstate, relayPool: ww.pool, auth: ww.auth, namespace: NAMESPACE });
+  const links = [zone, nearby];
   const emit = (ev) => onEvent(ev);
 
-  const outgoing = new Map();        // job id -> {id, pubkey, info, files: [{fid, name, file}], state}
+  const outgoing = new Map();        // job id -> {id, pubkey, info, files: [{fid, name, file}], state, acked}
   const incoming = new Map();        // offer id -> {pubkey, files}, waiting for our answer
   const accepted = new Map();        // offer id -> {pubkey, dir, fileIds}, answered yes
   const receiving = new Map();       // pubkey -> file being written {id, fid, name, size, got, written, writable, queue}
   const queues = new Map();          // pubkey -> tail of that peer's transfer queue
   const cancelled = new Set();
+  const names = new Map();           // pubkey -> name the device sent over the data channel
   let pairing = null;                // {session, role, peer, name, ttl, ack}
+  let networkKeyValue = null;
+  let networkState = "checking";     // checking | on | unavailable
 
-  // Names come straight from the device over the data channel (sent on connect and on
-  // rename); wireweave's presence name is only a fallback, as it is set once per device.
-  const names = new Map();
+  // The link a device is reachable on right now (zone first, then nearby).
+  const linkOf = (pk) => links.find((s) => s.peers.get(pk)?.dc?.readyState === "open") || null;
+  const dcOf = (pk) => linkOf(pk)?.peers.get(pk)?.dc || null;
   const nameOf = (pk) =>
-    names.get(pk) || data.participants.get("nostr-" + pk.slice(0, 12))?.identity || pk.slice(0, 8);
+    names.get(pk)
+    || links.map((s) => s.participants.get("nostr-" + pk.slice(0, 12))?.identity).find(Boolean)
+    || pk.slice(0, 8);
+
+  const sendControl = (pk, msg) => {
+    const s = linkOf(pk);
+    if (!s || !s.send(pk, JSON.stringify(msg))) throw new Error("device is not connected");
+  };
+  const sendRaw = (pk, buf) => {
+    const s = linkOf(pk);
+    if (!s || !s.send(pk, buf)) throw new Error("device disconnected");
+  };
   const announceName = (pk) => {
     try { sendControl(pk, { k: "name", name: alias }); } catch { /* the peer is gone; it asks again on reconnect */ }
   };
 
-  const sendControl = (pk, msg) => {
-    if (!data.send(pk, JSON.stringify(msg))) throw new Error("device is not connected");
-  };
-
   const assertOpen = (pk) => {
-    const dc = data.peers.get(pk)?.dc;
-    if (!dc || dc.readyState !== "open") throw new Error("device disconnected");
+    if (!dcOf(pk)) throw new Error("device disconnected");
   };
 
   const drain = async (pk) => {
     for (;;) {
-      const dc = data.peers.get(pk)?.dc;
-      if (!dc || dc.readyState !== "open") throw new Error("device disconnected");
+      const dc = dcOf(pk);
+      if (!dc) throw new Error("device disconnected");
       if (dc.bufferedAmount <= MAX_BUFFERED) return;
       await sleep(25);
     }
@@ -148,7 +196,7 @@ export function createWire({ alias, onEvent }) {
             await sleep(10);
           }
           const buf = await f.file.slice(off, off + CHUNK).arrayBuffer();
-          if (!data.send(job.pubkey, buf)) throw new Error("device disconnected");
+          sendRaw(job.pubkey, buf);
           done += buf.byteLength;
           emit({ event: "progress", job: job.id, file: f.name, done, size: f.file.size });
         }
@@ -281,25 +329,8 @@ export function createWire({ alias, onEvent }) {
     }).catch((e) => failReceive(pk, rx, e));
   }
 
-  data.addEventListener("data", (e) => {
-    const { peerPubkey: pk, data: payload } = e.detail;
-    if (typeof payload !== "string") { onChunk(pk, payload); return; }
-    let msg;
-    try { msg = JSON.parse(payload); } catch { return; }
-    onControl(pk, msg);
-  });
-
-  data.addEventListener("connected", () => emit({ event: "connected" }));
-  data.addEventListener("participants", () => emit({ event: "devices" }));
-  data.addEventListener("error", (e) => emit({ event: "error", message: e.detail.message }));
-  data.addEventListener("peer-open", (e) => {
-    if (e.detail.unreliable) return;
-    announceName(e.detail.peerPubkey);
-    emit({ event: "devices" });
-  });
-  data.addEventListener("peer-close", (e) => {
-    const pk = e.detail.peerPubkey;
-    if (e.detail.unreliable) return;
+  // A device that left (on any link) drops its offers, jobs and files in progress.
+  function dropPeer(pk) {
     for (const [id, o] of incoming) if (o.pubkey === pk) { incoming.delete(id); emit({ event: "offer_withdrawn", id }); }
     for (const job of outgoing.values()) {
       if (job.pubkey !== pk) continue;
@@ -310,14 +341,47 @@ export function createWire({ alias, onEvent }) {
     const rx = receiving.get(pk);
     if (rx) { receiving.delete(pk); abortReceive(rx); }
     for (const [id, a] of accepted) if (a.pubkey === pk) accepted.delete(id);
-    emit({ event: "devices" });
-  });
-
-  function onlineDevices() {
-    return [...data.peers.keys()]
-      .filter((pk) => data.peers.get(pk).dc?.readyState === "open")
-      .map((pk) => ({ pubkey: pk, name: nameOf(pk) }));
   }
+
+  function attach(session) {
+    session.addEventListener("data", (e) => {
+      const { peerPubkey: pk, data: payload } = e.detail;
+      if (typeof payload !== "string") { onChunk(pk, payload); return; }
+      let msg;
+      try { msg = JSON.parse(payload); } catch { return; }
+      onControl(pk, msg);
+    });
+    session.addEventListener("participants", () => emit({ event: "devices" }));
+    session.addEventListener("error", (e) => emit({ event: "error", message: e.detail.message }));
+    session.addEventListener("peer-open", (e) => {
+      if (e.detail.unreliable) return;
+      announceName(e.detail.peerPubkey);
+      emit({ event: "devices" });
+    });
+    session.addEventListener("peer-close", (e) => {
+      const pk = e.detail.peerPubkey;
+      if (e.detail.unreliable || linkOf(pk)) return;      // still reachable on the other link
+      dropPeer(pk);
+      emit({ event: "devices" });
+    });
+    // A device that reloads can leave a half-open peer behind on the other side.
+    // wireweave keeps that entry, so its presence heartbeats never reconnect the
+    // device. Drop any peer that has not opened within STALE_MS; the next heartbeat
+    // then reconnects it. Uses wireweave's internal _closePeer, pinned with the submodule.
+    const staleSince = new Map();
+    setInterval(() => {
+      const now = Date.now();
+      for (const pk of Array.from(session.peers.keys())) {
+        if (session.peers.get(pk).dc?.readyState === "open") { staleSince.delete(pk); continue; }
+        const since = staleSince.get(pk) ?? now;
+        staleSince.set(pk, since);
+        if (now - since > STALE_MS) { staleSince.delete(pk); session._closePeer(pk); }
+      }
+    }, 10000);
+  }
+  links.forEach(attach);
+
+  zone.addEventListener("connected", () => emit({ event: "connected" }));
 
   function startJob(pk, info, files) {
     const job = { id: newId(), pubkey: pk, info, files, state: "waiting", acked: new Map() };
@@ -326,26 +390,39 @@ export function createWire({ alias, onEvent }) {
     return job;
   }
 
+  function onlineDevices() {
+    const seen = new Map();
+    for (const s of links) {
+      for (const pk of s.peers.keys()) {
+        if (seen.has(pk) || !linkOf(pk)) continue;
+        seen.set(pk, { pubkey: pk, name: nameOf(pk), online: true });
+      }
+    }
+    return [...seen.values()];
+  }
+
   // -- zone: paired devices share one room and stay in it -------------------
 
-  // A device that reloads can leave a half-open peer behind on the other side.
-  // wireweave keeps that entry, so its presence heartbeats never reconnect the
-  // device. Drop any peer that has not opened within STALE_MS; the next heartbeat
-  // then reconnects it. Uses wireweave's internal _closePeer, pinned with the submodule.
-  const staleSince = new Map();
-  setInterval(() => {
-    const now = Date.now();
-    for (const pk of Array.from(data.peers.keys())) {
-      if (data.peers.get(pk).dc?.readyState === "open") { staleSince.delete(pk); continue; }
-      const since = staleSince.get(pk) ?? now;
-      staleSince.set(pk, since);
-      if (now - since > STALE_MS) { staleSince.delete(pk); data._closePeer(pk); }
-    }
-  }, 10000);
-
   async function joinZone(secret) {
-    await data.disconnect();
-    await data.connect(await zoneRoom(secret), { displayName: alias });
+    await zone.disconnect();
+    await zone.connect(await zoneRoom(secret), { displayName: alias });
+  }
+
+  // -- nearby: devices behind the same public address ------------------------
+
+  async function refreshNetwork() {
+    const key = await networkKey();
+    if (key === networkKeyValue && networkState !== "checking") return;
+    networkKeyValue = key;
+    if (key) {
+      networkState = "on";
+      await nearby.disconnect();
+      await nearby.connect(await nearbyRoom(key), { displayName: alias });
+    } else {
+      networkState = "unavailable";
+      await nearby.disconnect();
+    }
+    emit({ event: "network", state: networkState });
   }
 
   // -- pairing: a short-lived room per code, host approves the joiner -------
@@ -422,12 +499,12 @@ export function createWire({ alias, onEvent }) {
       emit({ event: "pair_declined" });
       return;
     }
-    const zone = loadZone() || { secret: newZoneSecret(), host: alias, joined: Date.now() };
-    saveZone(zone);
+    const z = loadZone() || { secret: newZoneSecret(), host: alias, joined: Date.now() };
+    saveZone(z);
     rememberMember(p.peer, p.name);
-    p.session.send(p.peer, JSON.stringify({ k: "zone", secret: zone.secret, host: alias }));
+    p.session.send(p.peer, JSON.stringify({ k: "zone", secret: z.secret, host: alias }));
     p.ack = setTimeout(() => { if (pairing === p) { emit({ event: "pair_done", name: p.name }); closePairing(); } }, PAIR_ACK_MS);
-    await joinZone(zone.secret);
+    await joinZone(z.secret);
   }
 
   return {
@@ -436,13 +513,14 @@ export function createWire({ alias, onEvent }) {
     async join() {
       ww.auth.loadFromStorage() || ww.auth.generateKey();
       ww.pool.connect();
-      const zone = loadZone();
-      if (zone) await joinZone(zone.secret);
+      const z = loadZone();
+      await Promise.all([z ? joinZone(z.secret) : null, refreshNetwork()]);
+      setInterval(() => refreshNetwork().catch(() => {}), NETWORK_CHECK_MS);
     },
 
     leave() {
       closePairing();
-      return data.disconnect();
+      return Promise.all([zone.disconnect(), nearby.disconnect()]);
     },
 
     zone: loadZone,
@@ -450,7 +528,7 @@ export function createWire({ alias, onEvent }) {
     async leaveZone() {
       closePairing();
       saveZone(null);
-      await data.disconnect();
+      await zone.disconnect();
       emit({ event: "devices" });
     },
 
@@ -458,7 +536,7 @@ export function createWire({ alias, onEvent }) {
     closePairing,
     answerPair,
 
-    devices: onlineDevices,
+    network: () => networkState,
 
     // Every paired device, online or not, as if it were in the room.
     members() {
@@ -467,20 +545,29 @@ export function createWire({ alias, onEvent }) {
         out.set(pk, { pubkey: pk, name: m.name, online: false, seen: m.seen });
       }
       for (const d of onlineDevices()) {
-        const remembered = out.get(d.pubkey)?.name;
-        const name = d.name === d.pubkey.slice(0, 8) && remembered ? remembered : d.name;
+        const entry = out.get(d.pubkey);
+        if (!entry) continue;
+        const name = d.name === d.pubkey.slice(0, 8) && entry.name ? entry.name : d.name;
         out.set(d.pubkey, { pubkey: d.pubkey, name, online: true, seen: Date.now() });
         rememberMember(d.pubkey, name);
       }
       return [...out.values()];
     },
 
+    // Devices on this network that are not paired: visible, accept each transfer.
+    nearby() {
+      const members = loadZone()?.members || {};
+      return onlineDevices().filter((d) => !members[d.pubkey]);
+    },
+
     // Changes the name other devices see: told to every connected device at once,
-    // and used for later presence and pairing messages.
-    setAlias(name) {
+    // and republished by reconnecting the links.
+    async setAlias(name) {
       alias = name;
-      data.displayName = name;
       for (const d of onlineDevices()) announceName(d.pubkey);
+      const z = loadZone();
+      if (z) await joinZone(z.secret);
+      if (networkKeyValue) await refreshNetwork();
     },
 
     sendFiles(pk, entries, label) {

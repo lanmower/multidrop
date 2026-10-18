@@ -132,3 +132,6 @@ select { min-width: 12rem; }
   .me, .device { width: 7.5rem; }
   .avatar { width: 3.6rem; height: 3.6rem; font-size: 1.2rem; }
 }
+/* Nearby devices (same network, not paired) are outlined, paired ones filled. */
+.device.nearby .avatar { background: transparent; border: 2px dashed var(--accent); color: var(--accent); }
+.device.nearby .meta { color: var(--accent); }

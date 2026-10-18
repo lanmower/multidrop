@@ -11,6 +11,7 @@ const unchecked = new Map();   // offer id -> Set of file ids the user unticked
 let offers = [];               // incoming offers, oldest first
 let pendingPair = null;        // {name} while a joiner waits for approval (host side)
 let devices = [];              // paired devices, online or not
+let nearbyList = [];           // unpaired devices on this network, online
 let wire = null;
 let alias = "";
 let folder = null;             // the receive folder handle, once chosen
@@ -241,7 +242,7 @@ function renderOffers() {
 // Accepting picks the folder first: the picker must open inside the click, so the
 // call starts synchronously. Files then stream into that folder, never into memory.
 async function acceptOffer(o, ids, known = null) {
-  let dir = known;
+  let dir = known || (folderReady ? folder : null);
   if (!dir && ids.length) {
     try {
       dir = await window.showDirectoryPicker({ mode: "readwrite", id: "multidrop" });
@@ -260,7 +261,17 @@ async function acceptOffer(o, ids, known = null) {
 
 function refreshDevices() {
   devices = wire ? wire.members() : [];
+  nearbyList = wire ? wire.nearby() : [];
   renderDevices();
+}
+
+function renderNetwork() {
+  const state = wire ? wire.network() : "checking";
+  $("#nearby-hint").textContent = {
+    checking: "Looking for devices on this network …",
+    on: "Devices on this network appear here without pairing. Each transfer still asks you first.",
+    unavailable: "Nearby is off: this browser cannot read its network address, so only paired devices appear.",
+  }[state];
 }
 
 function ago(ms) {
@@ -292,28 +303,35 @@ function renderDevices() {
   const previous = select.value;
   select.replaceChildren();
   const paired = loadZone();
-  box.classList.toggle("big", devices.length + 1 > 6);
   box.append(el("div", { class: "me" },
     el("div", { class: "avatar" }, (alias[0] || "?").toUpperCase()),
     el("div", { class: "name" }, alias),
     el("div", { class: "meta" }, paired ? "Visible to your paired devices" : "Not paired yet")));
 
+  const all = [
+    ...devices.map((d) => ({ ...d, nearby: false })),
+    ...nearbyList.map((d) => ({ ...d, nearby: true })),
+  ];
+  box.classList.toggle("big", all.length + 1 > 6);
+
   // The text target lists only devices that are online right now; with none,
   // the control is disabled and says why, instead of showing an empty dropdown.
-  const online = devices.filter((d) => d.online);
+  const online = all.filter((d) => d.online);
   select.disabled = online.length === 0;
   $("#text-form button[type=submit]").disabled = online.length === 0;
   if (!online.length) select.append(el("option", { value: "" }, paired ? "No paired device is online" : "Pair a device first"));
 
-  const total = devices.length + 1;                       // the pairing bubble takes a place too
-  const place = (node, i) => {
+  const place = (node, i, total) => {
     const { ring, angle } = ringPosition(i, total);
     node.setAttribute("style", `--a:${angle}deg;--r:var(--r${ring})`);
     return node;
   };
-  devices.forEach((d, i) => {
-    const status = d.online ? "Available" : `Last seen ${ago(d.seen)}`;
-    const bubble = el("div", { class: d.online ? "device card drop" : "device offline" },
+  const total = all.length + 1;                           // the pairing bubble takes a place too
+  all.forEach((d, i) => {
+    const status = d.online
+      ? (d.nearby ? "Nearby" : "Available")
+      : `Last seen ${ago(d.seen)}`;
+    const bubble = el("div", { class: [d.online ? "device card drop" : "device offline", d.nearby ? "nearby" : ""].join(" ").trim() },
       el("div", { class: "avatar", style: `--hue:${hueOf(d.pubkey)}` }, (d.name[0] || "?").toUpperCase()),
       el("div", { class: "name" }, d.name),
       el("div", { class: "meta" }, status));
@@ -323,7 +341,7 @@ function renderDevices() {
     } else {
       bubble.title = "Offline. It appears here as soon as its page is open.";
     }
-    box.append(place(bubble, i));
+    box.append(place(bubble, i, total));
   });
   const add = el("div", { class: "device pairbubble", title: "Pair a device" },
     el("div", { class: "avatar" }, "+"),
@@ -332,8 +350,9 @@ function renderDevices() {
     $("#pair-section").scrollIntoView({ behavior: "smooth" });
     $("#pair-code").focus();
   });
-  box.append(place(add, devices.length));
+  box.append(place(add, all.length, total));
   if (previous) select.value = previous;
+  renderNetwork();
 }
 
 function makeDropTarget(card, onFiles) {
@@ -443,6 +462,10 @@ function onEvent(ev) {
     case "devices":
       refreshDevices();
       renderZoneState();
+      break;
+    case "network":
+      renderNetwork();
+      refreshDevices();
       break;
     case "pair_waiting":
       showPairState(`Connected to ${ev.name}. Waiting for it to accept …`);
