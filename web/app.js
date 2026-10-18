@@ -13,6 +13,90 @@ let pendingPair = null;        // {name} while a joiner waits for approval (host
 let devices = [];              // paired devices, online or not
 let wire = null;
 let alias = "";
+let folder = null;             // the receive folder handle, once chosen
+let folderReady = false;       // true while the browser grants write access to it
+
+// -- receive folder: chosen once, kept in IndexedDB ------------------------
+
+const openDb = () => new Promise((res, rej) => {
+  const req = indexedDB.open("multidrop", 1);
+  req.onupgradeneeded = () => req.result.createObjectStore("kv");
+  req.onsuccess = () => res(req.result);
+  req.onerror = () => rej(req.error);
+});
+
+async function kv(mode, run) {
+  const db = await openDb();
+  return new Promise((res, rej) => {
+    const tx = db.transaction("kv", mode);
+    const req = run(tx.objectStore("kv"));
+    tx.oncomplete = () => res(req.result);
+    tx.onerror = () => rej(tx.error);
+  });
+}
+
+// A test double or a browser without storable handles stays in memory only.
+async function saveFolder(handle) {
+  try { await kv("readwrite", (s) => s.put(handle, "receive")); } catch { /* memory only */ }
+}
+
+async function loadFolder() {
+  try { return await kv("readonly", (s) => s.get("receive")) || null; } catch { return null; }
+}
+
+async function refreshFolder() {
+  folder = folder || (await loadFolder());
+  folderReady = Boolean(folder) && (await folder.queryPermission({ mode: "readwrite" })) === "granted";
+  renderFolder();
+}
+
+// Picking happens inside the click, so the picker opens synchronously.
+async function chooseFolder() {
+  let handle;
+  try {
+    handle = await window.showDirectoryPicker({ mode: "readwrite", id: "multidrop-receive" });
+  } catch {
+    return;                                              // cancelled
+  }
+  folder = handle;
+  folderReady = true;
+  await saveFolder(handle);
+  renderFolder();
+  addLog(`Received files from paired devices will be written into “${handle.name}”`);
+}
+
+async function allowFolder() {
+  if (!folder) return;
+  folderReady = (await folder.requestPermission({ mode: "readwrite" })) === "granted";
+  renderFolder();
+}
+
+async function forgetFolder() {
+  folder = null;
+  folderReady = false;
+  try { await kv("readwrite", (s) => s.delete("receive")); } catch { /* nothing stored */ }
+  renderFolder();
+}
+
+function renderFolder() {
+  const supported = canReceiveToFolder();
+  $("#folder-note").hidden = supported;
+  $("#folder-choose").disabled = !supported;
+  $("#folder-state").textContent = !folder ? "Not set"
+    : folderReady ? `Writing to “${folder.name}”`
+    : `“${folder.name}” needs permission again`;
+  $("#folder-allow").hidden = !(folder && !folderReady);
+  $("#folder-forget").hidden = !folder;
+}
+
+// Paired devices write straight into the chosen folder; everyone else still asks.
+const isPaired = (pk) => Boolean(loadZone()?.members?.[pk]);
+
+function autoAccept(o) {
+  if (!folderReady || !folder || !isPaired(o.pubkey)) return false;
+  acceptOffer(o, o.files.map((f) => f.id), folder);
+  return true;
+}
 
 function el(tag, attrs = {}, ...children) {
   const e = document.createElement(tag);
@@ -155,9 +239,9 @@ function renderOffers() {
 
 // Accepting picks the folder first: the picker must open inside the click, so the
 // call starts synchronously. Files then stream into that folder, never into memory.
-async function acceptOffer(o, ids) {
-  let dir = null;
-  if (ids.length) {
+async function acceptOffer(o, ids, known = null) {
+  let dir = known;
+  if (!dir && ids.length) {
     try {
       dir = await window.showDirectoryPicker({ mode: "readwrite", id: "multidrop" });
     } catch {
@@ -386,6 +470,10 @@ function onEvent(ev) {
       showPairState("Connection to the other device was lost. Try again.");
       break;
     case "offer":
+      if (autoAccept(ev.offer)) {
+        addLog(`${ev.offer.from} sent ${ev.offer.files.length} item(s); writing to “${folder.name}”`);
+        break;
+      }
       offers.push(ev.offer);
       renderOffers();
       addLog(`${ev.offer.from} wants to send ${ev.offer.files.length} item(s)`);
@@ -434,6 +522,10 @@ function init() {
   });
   setInterval(refreshDevices, 60000);                     // keeps "last seen" fresh
   $("#pair-show").addEventListener("click", showHostCode);
+  $("#folder-choose").addEventListener("click", chooseFolder);
+  $("#folder-allow").addEventListener("click", allowFolder);
+  $("#folder-forget").addEventListener("click", forgetFolder);
+  refreshFolder();
   $("#pair-cancel").addEventListener("click", () => { hideHostCode(); showPairState(""); renderZoneState(); });
   $("#pair-join").addEventListener("submit", (ev) => {
     ev.preventDefault();

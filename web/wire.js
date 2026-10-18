@@ -170,7 +170,7 @@ export function createWire({ alias, onEvent }) {
         incoming.set(msg.id, { pubkey: pk, files: msg.files });
         const files = msg.files.map((f) => ({ id: f.id, name: baseName(f.name), size: f.size }));
         emit({ event: "offer", offer: {
-          id: msg.id, from: msg.from || nameOf(pk), files,
+          id: msg.id, from: msg.from || nameOf(pk), pubkey: pk, files,
           total_size: files.reduce((s, f) => s + f.size, 0),
         } });
         return;
