@@ -11,7 +11,7 @@
 {
   "imports": {
     "nostr-tools": "https://esm.sh/nostr-tools@2.25.2",
-    "xstate": "https://esm.sh/xstate@5",
+    "xstate": "https://esm.sh/xstate@5.33.3",
     "qrcode-generator": "https://esm.sh/qrcode-generator@1.4.4"
   }
 }
@@ -28,21 +28,50 @@
 </header>
 
 <main>
+  <p class="hint notice">The web edition finds devices through public nostr relays on the internet. Files go directly between the browsers; device names are only exchanged once two devices are connected. For AirDrop, Quick Share, LocalSend and AirPlay, use the <a href="https://github.com/digitaldanis/multidrop#download">MultiDrop app</a>.</p>
   <section id="offers-section" hidden>
     <h2>Incoming</h2>
     <div id="offers"></div>
   </section>
 
   <section id="nearby">
-    <h2>Your devices</h2>
-    <p class="hint">Paired devices stay here wherever they are. Drop files or folders on one, or click it and choose.</p>
+    <h2>Nearby</h2>
+    <p class="hint">Open MultiDrop on another device on the same Wi-Fi and it appears here – no code needed. Drop files or folders on it, or click it and choose. The other side accepts every transfer.</p>
     <p class="hint" id="nearby-hint"></p>
     <div id="devices" class="stage"></div>
   </section>
 
-  <section id="pair-section">
-    <h2>Pair a device</h2>
-    <p class="hint">Pair once and the device stays in your zone on every page, wherever it is. Show a code here and enter it there, or scan the QR code.</p>
+  <section>
+    <h2>Send text or a link</h2>
+    <form id="text-form">
+      <textarea id="text" rows="2" placeholder="Text or https://…" required></textarea>
+      <div class="row">
+        <select id="text-target"></select>
+        <button type="submit">Send</button>
+      </div>
+    </form>
+  </section>
+
+  <section>
+    <h2>Transfers</h2>
+    <div id="jobs"></div>
+  </section>
+
+  <section id="folder-section">
+    <h2>Receive folder</h2>
+    <p class="hint">Accepted files are written into this folder. Files from devices you remembered are saved here without asking. Choose it once; after a restart the browser may ask you to allow access again.</p>
+    <div class="row">
+      <span id="folder-state" class="meta">Not set</span>
+      <button id="folder-choose" type="button" class="primary">Choose folder</button>
+      <button id="folder-allow" type="button" hidden>Allow access</button>
+      <button id="folder-forget" type="button" class="danger" hidden>Forget</button>
+    </div>
+    <p id="folder-note" class="hint" hidden>Needs Chrome, Edge or Opera, which can write into a chosen folder.</p>
+  </section>
+
+  <details id="pair-section">
+    <summary>Remember a device (optional)</summary>
+    <p class="hint">Only needed to reach your own devices on other networks, for example your phone on mobile data. Show a code here and enter it there, or scan the QR code.</p>
     <div id="pair-requests"></div>
     <div class="row">
       <button id="pair-show" type="button" class="primary">Show a pairing code</button>
@@ -61,35 +90,8 @@
     </div>
     <p id="pair-state" class="meta"></p>
     <button id="leave-zone" type="button" class="danger" hidden>Leave zone on this device</button>
-  </section>
+  </details>
 
-  <section id="folder-section">
-    <h2>Receive folder</h2>
-    <p class="hint">Files from your paired devices are written into this folder as they arrive, without a prompt. Choose it once; after a restart the browser may ask you to allow access again.</p>
-    <div class="row">
-      <span id="folder-state" class="meta">Not set</span>
-      <button id="folder-choose" type="button" class="primary">Choose folder</button>
-      <button id="folder-allow" type="button" hidden>Allow access</button>
-      <button id="folder-forget" type="button" class="danger" hidden>Forget</button>
-    </div>
-    <p id="folder-note" class="hint" hidden>Needs Chrome, Edge or Opera, which can write into a chosen folder.</p>
-  </section>
-
-  <section>
-    <h2>Send text or a link</h2>
-    <form id="text-form">
-      <textarea id="text" rows="2" placeholder="Text or https://…" required></textarea>
-      <div class="row">
-        <select id="text-target"></select>
-        <button type="submit">Send</button>
-      </div>
-    </form>
-  </section>
-
-  <section>
-    <h2>Transfers</h2>
-    <div id="jobs"></div>
-  </section>
 
   <section>
     <h2>History</h2>

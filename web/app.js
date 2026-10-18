@@ -64,7 +64,7 @@ async function chooseFolder() {
   folderReady = true;
   await saveFolder(handle);
   renderFolder();
-  addLog(`Received files from paired devices will be written into “${handle.name}”`);
+  addLog(`Accepted files will be written into “${handle.name}”`);
 }
 
 async function allowFolder() {
@@ -196,7 +196,7 @@ function renderZoneState() {
   if ($("#pair-state").textContent) return;
   showPairState(zone
     ? `Paired${zone.host ? ` via ${zone.host}` : ""}. This device stays in your zone.`
-    : "Not paired yet. Show a code here, or enter the code from another device.");
+    : "No remembered devices. Devices on this Wi-Fi appear without this.");
 }
 
 // -- status, offers -------------------------------------------------------
@@ -270,8 +270,8 @@ function renderNetwork() {
   const state = wire ? wire.network() : "checking";
   $("#nearby-hint").textContent = {
     checking: "Looking for devices on this network …",
-    on: "Devices on this network appear here without pairing. Each transfer still asks you first.",
-    unavailable: "Nearby is off: this browser cannot read its network address, so only paired devices appear.",
+    on: "",
+    unavailable: "Nearby is off: this browser cannot read its network address, so only remembered devices appear.",
   }[state];
 }
 
@@ -326,7 +326,7 @@ function renderDevices() {
   box.append(el("div", { class: "me" },
     el("div", { class: "avatar" }, (alias[0] || "?").toUpperCase()),
     el("div", { class: "name" }, alias),
-    el("div", { class: "meta" }, paired ? "Visible to your paired devices" : "Not paired yet")));
+    el("div", { class: "meta" }, paired ? "Visible on this Wi-Fi and to your devices" : "Visible on this Wi-Fi")));
 
   const items = [
     ...devices.map((d) => ({ ...d, nearby: false })),
@@ -339,7 +339,7 @@ function renderDevices() {
   // the control is disabled and says why, instead of showing an empty dropdown.
   select.disabled = sendable.length === 0;
   $("#text-form button[type=submit]").disabled = sendable.length === 0;
-  if (!sendable.length) select.append(el("option", { value: "" }, paired ? "No paired device is online" : "Pair a device first"));
+  if (!sendable.length) select.append(el("option", { value: "" }, "No device nearby yet"));
   for (const d of sendable) select.append(el("option", { value: d.pubkey }, d.reach === "relay" ? `${d.name} (via relays)` : d.name));
 
   const add = { pubkey: "", add: true, nearby: false };
@@ -349,8 +349,8 @@ function renderDevices() {
   for (const d of all) {
     const spot = at.get(d);
     const node = d.add
-      ? el("div", { class: "device pairbubble", title: "Pair a device" },
-          el("div", { class: "avatar" }, "+"), el("div", { class: "name" }, "Pair a device"))
+      ? el("div", { class: "device pairbubble", title: "Remember a device on other networks" },
+          el("div", { class: "avatar" }, "+"), el("div", { class: "name" }, "Remember a device"))
       : el("div", { class: [
             d.online ? "device card drop" : "device offline",
             d.nearby ? "nearby" : "",
@@ -361,6 +361,7 @@ function renderDevices() {
           el("div", { class: "meta" }, reachLabel(d)));
     if (d.add) {
       node.addEventListener("click", () => {
+        $("#pair-section").open = true;
         $("#pair-section").scrollIntoView({ behavior: "smooth" });
         $("#pair-code").focus();
       });
@@ -505,6 +506,7 @@ function onEvent(ev) {
       break;
     case "pair_request":
       pendingPair = { name: ev.name };
+      $("#pair-section").open = true;
       renderPairRequest();
       addLog(`${ev.name} asked to pair`);
       break;
@@ -631,6 +633,7 @@ function init() {
       refreshDevices();
       renderZoneState();
       if (link) {
+        $("#pair-section").open = true;
         $("#pair-code").value = link[1];
         joinWithCode(link[1]);
       }

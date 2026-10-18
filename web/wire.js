@@ -10,7 +10,12 @@
 //             resends what is unconfirmed.
 //
 // Two links find devices. `zone` holds paired devices (a shared secret). `nearby`
-// holds devices behind the same public address (ICE learns it from a STUN server).
+// holds devices behind the same public address (ICE learns it from a STUN server);
+// of those, only devices that pass the local-network probe are shown or accepted,
+// so strangers behind the same carrier NAT or campus address stay invisible.
+//
+// Privacy: presence events on the public relays carry only a neutral name; real
+// device names travel over the encrypted data channel. No shared TURN servers.
 //
 // Proximity: a direct probe over the nearby link tells whether two devices reach
 // each other on the local network (no public address involved), and the data
@@ -19,7 +24,7 @@
 // Pairing: a 6-digit code names a short-lived pairing room. The host approves the
 // joiner, then sends a zone secret over the encrypted data channel.
 import { createWireweave } from "./vendor/wireweave/src/wireweave.js";
-import { createDataSession } from "./vendor/wireweave/src/data.js";
+import { createDataSession, setIceServers } from "./vendor/wireweave/src/data.js";
 import * as NostrTools from "nostr-tools";
 import * as xstate from "xstate";
 
@@ -32,6 +37,8 @@ const RELAYS = [
   "wss://relay.snort.social",
 ];
 const STUN = [{ urls: "stun:stun.l.google.com:19302" }, { urls: "stun:stun.cloudflare.com:3478" }];
+const ANON = "MultiDrop";                // the name relays see in presence events
+setIceServers(STUN);                     // instead of wireweave's shared public TURN credentials
 const ZONE_KEY = "multidrop-zone";
 const CHUNK = 64 * 1024;                 // direct chunk; well under the message limit browsers accept
 const WINDOW = 8 * CHUNK;                // unacknowledged bytes a direct sender may have in flight
@@ -188,12 +195,13 @@ export function createWire({ alias, onEvent }) {
   const dcOf = (pk) => linkOf(pk)?.peers.get(pk)?.dc || null;
   const nameOf = (pk) =>
     names.get(pk)
-    || links.map(([s]) => s.participants.get("nostr-" + pk.slice(0, 12))?.identity).find(Boolean)
+    || links.map(([s]) => s.participants.get("nostr-" + pk.slice(0, 12))?.identity).find((n) => n && n !== ANON)
     || loadZone()?.members?.[pk]?.name
     || pk.slice(0, 8);
   const isMember = (pk) => Boolean(loadZone()?.members?.[pk]);
-  // Relay messages are accepted from paired devices and from devices seen on this network.
-  const knownPeer = (pk) => isMember(pk) || Boolean(seenVia.get(pk) && Date.now() - seenVia.get(pk).at < SEEN_MS);
+  // Messages are accepted from paired devices and from devices on the same local network.
+  const onLanNow = (pk) => lan.get(pk)?.state === "yes";
+  const knownPeer = (pk) => isMember(pk) || onLanNow(pk);
 
   const sendControl = (pk, msg) => {
     const s = linkOf(pk);
@@ -345,7 +353,7 @@ export function createWire({ alias, onEvent }) {
   function onControl(pk, msg, via) {
     switch (msg.k) {
       case "offer": {
-        if (via === "relay" && !knownPeer(pk)) return;   // strangers on relays are ignored
+        if (!knownPeer(pk)) return;                       // strangers are ignored
         routes.set(msg.id, via);
         incoming.set(msg.id, { pubkey: pk, files: msg.files, via });
         const files = msg.files.map((f) => ({ id: f.id, name: baseName(f.name), size: f.size }));
@@ -427,6 +435,7 @@ export function createWire({ alias, onEvent }) {
         return;
       }
       case "text":
+        if (!knownPeer(pk)) return;
         emit({ event: "message", from: nameOf(pk), kind: /^https?:\/\//i.test(msg.text) ? "url" : "text", text: msg.text });
         return;
       case "lan":
@@ -572,7 +581,10 @@ export function createWire({ alias, onEvent }) {
         if (session.peers.get(pk).dc?.readyState === "open") { staleSince.delete(pk); continue; }
         const since = staleSince.get(pk) ?? now;
         staleSince.set(pk, since);
-        if (now - since > STALE_MS) { staleSince.delete(pk); session._closePeer(pk); }
+        if (now - since > STALE_MS && typeof session._closePeer === "function") {
+          staleSince.delete(pk);
+          session._closePeer(pk);
+        }
       }
     }, 10000);
   }
@@ -614,6 +626,7 @@ export function createWire({ alias, onEvent }) {
     lanPcs.delete(pk);
     p.pc.close();
     lan.set(pk, { state: ok ? "yes" : "no", at: Date.now() });
+    if (ok) announceName(pk);              // in case the first one was lost while the peer opened
     emit({ event: "devices" });
   }
 
@@ -704,7 +717,7 @@ export function createWire({ alias, onEvent }) {
 
   async function joinZone(secret) {
     await zone.disconnect();
-    await zone.connect(await zoneRoom(secret), { displayName: alias });
+    await zone.connect(await zoneRoom(secret), { displayName: ANON });
   }
 
   // -- nearby: devices behind the same public address ------------------------
@@ -716,7 +729,7 @@ export function createWire({ alias, onEvent }) {
     if (key) {
       networkState = "on";
       await nearby.disconnect();
-      await nearby.connect(await nearbyRoom(key), { displayName: alias });
+      await nearby.connect(await nearbyRoom(key), { displayName: ANON });
     } else {
       networkState = "unavailable";
       await nearby.disconnect();
@@ -795,7 +808,7 @@ export function createWire({ alias, onEvent }) {
       if (pairing === p && !p.paired && !e.detail.unreliable && e.detail.peerPubkey === p.peer) emit({ event: "pair_lost" });
     });
     try {
-      await session.connect(await pairRoom(code), { displayName: alias });
+      await session.connect(await pairRoom(code), { displayName: ANON });
     } catch (e) {
       if (pairing === p) closePairing();
       emit({ event: "error", message: `pairing: ${e.message}` });
@@ -885,19 +898,15 @@ export function createWire({ alias, onEvent }) {
       return [...out.values()];
     },
 
-    // Devices on this network that are not paired: visible, accept each transfer.
+    // Devices on the same local network that are not paired: visible, accept each transfer.
     nearby() {
-      return devicesWhere((pk, status) => !isMember(pk) && (status.link === "nearby" || status.reach === "direct"));
+      return devicesWhere((pk, status) => !isMember(pk) && status.reach === "direct" && status.lan);
     },
 
-    // Changes the name other devices see: told to every connected device at once,
-    // and republished by reconnecting the links.
-    async setAlias(name) {
+    // Changes the name other devices see: told to every connected device at once.
+    setAlias(name) {
       alias = name;
       for (const d of devicesWhere((pk, s) => s.reach === "direct")) announceName(d.pubkey);
-      const z = loadZone();
-      if (z) await joinZone(z.secret);
-      if (networkKeyValue) await refreshNetwork();
     },
 
     // via: "direct" (default) or "relay", when the device has no direct path and the user agreed.

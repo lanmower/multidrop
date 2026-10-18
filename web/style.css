@@ -17,7 +17,9 @@ h2 { margin: 0 0 .5rem; font-size: 1rem; text-transform: uppercase;
      letter-spacing: .06em; color: var(--muted); }
 #status { color: var(--muted); font-size: .9rem; }
 main { max-width: 60rem; margin: 0 auto; padding: 1rem 1.5rem 3rem; }
-section { margin: 1.5rem 0; }
+section, #pair-section { margin: 1.5rem 0; }
+#pair-section > summary { font-weight: 600; }
+.notice { border-left: 3px solid var(--muted); padding-left: .6rem; }
 .row { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; }
 .row h2 { margin: 0; flex: 1; }
 .hint, .meta { color: var(--muted); font-size: .85rem; }
