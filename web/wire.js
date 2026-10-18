@@ -11,11 +11,19 @@ import * as NostrTools from "nostr-tools";
 import * as xstate from "xstate";
 
 const NAMESPACE = "multidrop";
+const RELAYS = [
+  "wss://relay.primal.net",
+  "wss://nos.lol",
+  "wss://offchain.pub",
+  "wss://nostr-pub.wellorder.net",
+  "wss://relay.snort.social",
+];
 const ZONE_KEY = "multidrop-zone";
 const CHUNK = 64 * 1024;                 // well under the message limit browsers accept
 const MAX_BUFFERED = 4 * 1024 * 1024;    // pause sending while the channel is this full
 const PAIR_TTL_MS = 5 * 60 * 1000;       // a shown code stops working after this
 const PAIR_ACK_MS = 5000;                // host waits this long for the joiner's ack
+const STALE_MS = 30000;                  // a peer that has not opened by then is dropped
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const newId = () => crypto.randomUUID().slice(0, 12);
@@ -39,7 +47,9 @@ function saveZone(zone) {
 }
 
 export function createWire({ alias, onEvent }) {
-  const ww = createWireweave({ nostrTools: NostrTools, xstate });
+  // Relays that store and return kind-30078 events reliably (checked per relay);
+  // the wireweave default list includes several that drop them.
+  const ww = createWireweave({ nostrTools: NostrTools, xstate, relays: RELAYS });
   const data = ww.ensureData({ namespace: NAMESPACE });   // the zone session
   const emit = (ev) => onEvent(ev);
 
@@ -190,6 +200,21 @@ export function createWire({ alias, onEvent }) {
   }
 
   // -- zone: paired devices share one room and stay in it -------------------
+
+  // A device that reloads can leave a half-open peer behind on the other side.
+  // wireweave keeps that entry, so its presence heartbeats never reconnect the
+  // device. Drop any peer that has not opened within STALE_MS; the next heartbeat
+  // then reconnects it. Uses wireweave's internal _closePeer, pinned with the submodule.
+  const staleSince = new Map();
+  setInterval(() => {
+    const now = Date.now();
+    for (const pk of Array.from(data.peers.keys())) {
+      if (data.peers.get(pk).dc?.readyState === "open") { staleSince.delete(pk); continue; }
+      const since = staleSince.get(pk) ?? now;
+      staleSince.set(pk, since);
+      if (now - since > STALE_MS) { staleSince.delete(pk); data._closePeer(pk); }
+    }
+  }, 10000);
 
   async function joinZone(secret) {
     await data.disconnect();
