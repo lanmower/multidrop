@@ -44,7 +44,7 @@ const CHUNK = 64 * 1024;                 // direct chunk; well under the message
 const WINDOW = 8 * CHUNK;                // unacknowledged bytes a direct sender may have in flight
 const MAX_BUFFERED = 4 * 1024 * 1024;    // pause direct sending while the channel is this full
 const RELAY_CHUNK = 24 * 1024;           // relay chunk: base64 inside NIP-44 keeps the event well under relay limits
-const RELAY_WINDOW = 8 * RELAY_CHUNK;
+const RELAY_WINDOW = 24 * RELAY_CHUNK;   // relays deliver in parallel, so keep several chunks in flight
 const RELAY_STALL_MS = 8000;             // no progress this long: resend what is unconfirmed
 const RELAY_GIVE_UP_MS = 60000;          // no progress this long: the transfer fails
 const RELAY_FRESH_S = 600;               // relays hand back old messages; ignore anything older
@@ -57,6 +57,8 @@ const NETWORK_CHECK_MS = 120000;         // re-read the network address this oft
 const MEMBER_FRESH_MS = 60000;           // do not rewrite a member's last-seen more often than this
 const LAN_TIMEOUT_MS = 8000;             // local-network probe gives up after this
 const LAN_FRESH_MS = 600000;             // re-probe a device's local-network reach this often
+// Test seam (`?relayonly`): treat every device as unreachable directly, so the relay path can be exercised.
+const RELAY_ONLY = typeof location !== "undefined" && new URLSearchParams(location.search).has("relayonly");
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const newId = () => crypto.randomUUID().slice(0, 12);
@@ -167,6 +169,23 @@ export function createWire({ alias, onEvent }) {
   const ww = createWireweave({ nostrTools: NostrTools, xstate, relays: RELAYS });
   const zone = ww.ensureData({ namespace: NAMESPACE });
   const nearby = createDataSession({ fsm: ww.fsm, xstate, relayPool: ww.pool, auth: ww.auth, namespace: NAMESPACE });
+  // wireweave's relay pool caps publishing at a burst of 30 events, refilled 3 a second,
+  // and every relayed chunk costs two publishes (the recipient's copy and our own), which
+  // holds a relay transfer near 16 KB/s. Its constructor does not forward publishBudget, so
+  // the pool gets a looser token bucket here. Remove this once wireweave forwards the option.
+  ww.pool.budget = {
+    tokens: 300,
+    last: Date.now(),
+    tryConsume() {
+      const now = Date.now();
+      this.tokens = Math.min(300, this.tokens + ((now - this.last) / 1000) * 60);
+      this.last = now;
+      if (this.tokens < 1) return false;
+      this.tokens -= 1;
+      return true;
+    },
+    retryAfterMs: () => 250,
+  };
   const dm = ww.ensureDM();
   const links = [[zone, "zone"], [nearby, "nearby"]];
   const emit = (ev) => onEvent(ev);
@@ -211,9 +230,13 @@ export function createWire({ alias, onEvent }) {
     const s = linkOf(pk);
     if (!s || !s.send(pk, buf)) throw new Error("device disconnected");
   };
-  const relaySend = (pk, msg) => dm.send(pk, JSON.stringify(msg)).catch((e) => {
-    throw new Error(`relay: ${e.message || e}`);
-  });
+  // The same NIP-59 wrap as wireweave's dm.send, but published to the recipient only:
+  // dm.send also publishes a copy to ourselves, which doubles every relayed chunk.
+  const relaySend = async (pk, msg) => {
+    if (!ww.auth.privkey) throw new Error("relay: this device has no signing key");
+    const rumor = { kind: 14, created_at: Math.floor(Date.now() / 1000), tags: [["p", pk]], content: JSON.stringify(msg) };
+    ww.pool.publish(NostrTools.nip59.wrapEvent(rumor, ww.auth.privkey, pk));
+  };
   const sendVia = (via, pk, msg) => (via === "relay" ? relaySend(pk, msg) : Promise.resolve(sendControl(pk, msg)));
   // Replies follow the route of the offer or job they belong to.
   const reply = (id, pk, msg) => {
@@ -317,8 +340,14 @@ export function createWire({ alias, onEvent }) {
           sentBytes += buf.byteLength;
           emit({ event: "progress", job: job.id, file: f.name, done: sentBytes, size: f.file.size });
         }
+        // Until the receiver confirms the file, keep resending the end marker and whatever
+        // chunks it has not confirmed yet; relays may have dropped them.
         const end = { k: "end", id: job.id, fid: f.fid };
-        await retryUntil(() => relaySend(job.pubkey, end), () => flags.has(`done:${key(job.id, f.fid)}`), 2500, RELAY_GIVE_UP_MS, job);
+        await retryUntil(async () => {
+          const acked = job.acked.get(f.fid) || 0;
+          for (const [seq, msg] of sent) if ((seq + 1) * RELAY_CHUNK > acked) await relaySend(job.pubkey, msg);
+          await relaySend(job.pubkey, end);
+        }, () => flags.has(`done:${key(job.id, f.fid)}`), 4000, RELAY_GIVE_UP_MS, job);
       }
       emit({ event: "job_done", job: job.id, info: job.info });
     } catch (e) {
@@ -355,6 +384,8 @@ export function createWire({ alias, onEvent }) {
       case "offer": {
         if (!knownPeer(pk)) return;                       // strangers are ignored
         routes.set(msg.id, via);
+        reply(msg.id, pk, { k: "seen", id: msg.id });
+        if (incoming.has(msg.id) || accepted.has(msg.id)) return;   // a repeated offer
         incoming.set(msg.id, { pubkey: pk, files: msg.files, via });
         const files = msg.files.map((f) => ({ id: f.id, name: baseName(f.name), size: f.size }));
         emit({ event: "offer", offer: {
@@ -384,6 +415,9 @@ export function createWire({ alias, onEvent }) {
         job.acked.set(msg.fid, Math.max(job.acked.get(msg.fid) || 0, msg.n));
         return;
       }
+      case "seen":
+        flags.add(`seen:${msg.id}`);
+        return;
       case "ready":
         flags.add(`ready:${key(msg.id, msg.fid)}`);
         return;
@@ -473,7 +507,7 @@ export function createWire({ alias, onEvent }) {
 
   // Writes a chunk in arrival order and acknowledges it.
   function writeChunk(pk, rx, buf) {
-    const every = rx.relay ? 4 * RELAY_CHUNK : 1;
+    const every = rx.relay ? 2 * RELAY_CHUNK : 1;   // confirm often enough that the window keeps moving
     rx.queue = rx.queue.then(async () => {
       if (rx.error) throw rx.error;
       await rx.writable.write(buf);
@@ -700,7 +734,7 @@ export function createWire({ alias, onEvent }) {
   }
 
   function statusOf(pk) {
-    const direct = Boolean(dcOf(pk));
+    const direct = !RELAY_ONLY && Boolean(dcOf(pk));
     const seen = seenVia.get(pk);
     const fresh = Boolean(seen && Date.now() - seen.at < SEEN_MS);
     const reach = direct ? "direct" : fresh ? "relay" : "offline";
@@ -900,7 +934,7 @@ export function createWire({ alias, onEvent }) {
 
     // Devices on the same local network that are not paired: visible, accept each transfer.
     nearby() {
-      return devicesWhere((pk, status) => !isMember(pk) && status.reach === "direct" && status.lan);
+      return devicesWhere((pk, status) => !isMember(pk) && status.online && status.lan);
     },
 
     // Changes the name other devices see: told to every connected device at once.
@@ -914,8 +948,12 @@ export function createWire({ alias, onEvent }) {
       const files = entries.map((e, i) => ({ fid: String(i), name: e.path, file: e.file }));
       const job = startJob(pk, { items: files.map((f) => f.name), to: label }, files, via);
       const offer = { k: "offer", id: job.id, from: alias, files: files.map((f) => ({ id: f.fid, name: f.name, size: f.file.size })) };
-      sendVia(via, pk, offer).catch((e) => {
-        outgoing.delete(job.id);
+      const delivered = via === "relay"
+        ? retryUntil(() => relaySend(pk, offer), () => flags.has(`seen:${job.id}`), 4000, 90000, job)
+        : sendVia(via, pk, offer);
+      delivered.catch((e) => {
+        if (!outgoing.has(job.id)) return;                // cancelled, already reported
+        finishJob(job);
         emit({ event: "job_failed", job: job.id, error: e.message });
       });
       return job.id;
